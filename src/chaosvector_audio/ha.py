@@ -1,7 +1,7 @@
 """Home Assistant client — WebSocket intent execution for device control.
 
-Sends user commands ("turn off the lights") to HA's Assist pipeline via
-WebSocket and returns the response text.
+Uses a fresh connection per intent request to avoid stale WebSocket issues.
+This matches the philosophy of the STT/TTS clients (connect, do work, disconnect).
 """
 
 from __future__ import annotations
@@ -26,76 +26,82 @@ class HAConfig:
 
 
 class HAClient:
-    """Home Assistant WebSocket client for intent execution."""
+    """Home Assistant WebSocket client for intent execution.
+
+    Uses a fresh WebSocket connection per intent to avoid stale connections.
+    """
 
     def __init__(self, config: HAConfig) -> None:
         self.config = config
-        self._session: aiohttp.ClientSession | None = None
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._available = False
-        self._msg_id = 0
-        self._lock = asyncio.Lock()
 
     async def connect(self) -> bool:
-        """Connect to HA WebSocket and authenticate."""
+        """Verify HA is reachable (quick health check via HTTP)."""
         if not self.config.token:
             log.warning("HA token not configured")
             return False
 
-        self._session = aiohttp.ClientSession()
         try:
-            self._ws = await self._session.ws_connect(
-                self.config.ws_url,
-                timeout=aiohttp.ClientTimeout(total=10.0),
-            )
-
-            # Receive auth_required
-            msg = await self._ws.receive_json(timeout=5.0)
-            if msg.get("type") != "auth_required":
-                log.warning("HA unexpected message: %s", msg)
-                await self._close_ws()
-                return False
-
-            # Send auth
-            await self._ws.send_json({
-                "type": "auth",
-                "access_token": self.config.token,
-            })
-
-            # Receive auth_ok
-            msg = await self._ws.receive_json(timeout=5.0)
-            if msg.get("type") != "auth_ok":
-                log.warning("HA auth failed: %s", msg)
-                await self._close_ws()
-                return False
-
-            self._available = True
-            log.info("HA connected and authenticated")
-            return True
-
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.config.http_url}/api/",
+                    headers={"Authorization": f"Bearer {self.config.token}"},
+                    timeout=aiohttp.ClientTimeout(total=5.0),
+                ) as resp:
+                    self._available = resp.status == 200
+                    if self._available:
+                        log.info("HA connected and authenticated")
+                    else:
+                        log.warning("HA health check returned %d", resp.status)
+                    return self._available
         except Exception as e:
             log.warning("HA connect failed: %s", e)
-            await self._close_ws()
+            self._available = False
             return False
 
     @property
     def is_available(self) -> bool:
-        return self._available and self._ws is not None and not self._ws.closed
+        return self._available
 
     async def run_intent(self, text: str, conversation_id: str | None = None) -> str | None:
         """Send text to HA Assist pipeline and return response speech.
 
+        Opens a fresh WebSocket connection per request — no stale connections.
         Returns response text or None on failure.
         """
-        if not self.is_available:
-            # Try reconnect
-            if not await self.connect():
+        if not self.config.token:
+            return None
+
+        session = aiohttp.ClientSession()
+        try:
+            ws = await session.ws_connect(
+                self.config.ws_url,
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            )
+        except Exception as e:
+            log.warning("HA WebSocket connect failed: %s", e)
+            await session.close()
+            return None
+
+        try:
+            # Auth handshake
+            msg = await ws.receive_json(timeout=5.0)
+            if msg.get("type") != "auth_required":
+                log.warning("HA unexpected: %s", msg)
                 return None
 
-        async with self._lock:
-            self._msg_id += 1
-            msg_id = self._msg_id
+            await ws.send_json({
+                "type": "auth",
+                "access_token": self.config.token,
+            })
 
+            msg = await ws.receive_json(timeout=5.0)
+            if msg.get("type") != "auth_ok":
+                log.warning("HA auth failed: %s", msg)
+                return None
+
+            # Send intent
+            msg_id = 1
             cmd: dict = {
                 "id": msg_id,
                 "type": "assist_pipeline/run",
@@ -109,60 +115,55 @@ class HAClient:
             if self.config.pipeline:
                 cmd["pipeline"] = self.config.pipeline
 
-            try:
-                await self._ws.send_json(cmd)
+            await ws.send_json(cmd)
 
-                # Read events until intent-end or error
-                async with asyncio.timeout(self.config.intent_timeout):
-                    async for ws_msg in self._ws:
-                        if ws_msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(ws_msg.data)
-                            if data.get("id") != msg_id:
-                                continue
+            # Read events until intent-end or error
+            async with asyncio.timeout(self.config.intent_timeout):
+                async for ws_msg in ws:
+                    if ws_msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(ws_msg.data)
+                        if data.get("id") != msg_id:
+                            continue
 
-                            if data.get("type") == "result":
-                                if not data.get("success"):
-                                    log.warning("HA intent failed: %s", data)
-                                    return None
-                                continue
-
-                            event = data.get("event", {})
-                            event_type = event.get("type")
-
-                            if event_type == "intent-end":
-                                intent_output = event.get("data", {}).get("intent_output", {})
-                                response = intent_output.get("response", {})
-                                speech = response.get("speech", {}).get("plain", {})
-                                response_text = speech.get("speech", "")
-                                log.info("HA response: \"%s\"", response_text[:80])
-                                return response_text or "Done."
-
-                            if event_type == "error":
-                                log.warning("HA error: %s", event.get("data"))
+                        if data.get("type") == "result":
+                            if not data.get("success"):
+                                error = data.get("error", {})
+                                log.warning("HA intent failed: %s", error.get("message", data))
                                 return None
+                            continue
 
-                        elif ws_msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            self._available = False
+                        event = data.get("event", {})
+                        event_type = event.get("type")
+
+                        if event_type == "intent-end":
+                            intent_output = event.get("data", {}).get("intent_output", {})
+                            response = intent_output.get("response", {})
+                            speech = response.get("speech", {}).get("plain", {})
+                            response_text = speech.get("speech", "")
+                            log.info("HA response: \"%s\"", response_text[:80])
+                            return response_text or "Done."
+
+                        if event_type == "error":
+                            error_data = event.get("data", {})
+                            log.warning("HA error event: %s", error_data)
                             return None
 
-            except asyncio.TimeoutError:
-                log.warning("HA intent timed out")
-                return None
-            except Exception as e:
-                log.warning("HA intent error: %s", e)
-                self._available = False
-                return None
+                    elif ws_msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        log.warning("HA WebSocket closed unexpectedly")
+                        return None
+
+        except asyncio.TimeoutError:
+            log.warning("HA intent timed out (%.1fs)", self.config.intent_timeout)
+            return None
+        except Exception as e:
+            log.warning("HA intent error: %s", e)
+            return None
+        finally:
+            await ws.close()
+            await session.close()
 
         return None
 
     async def disconnect(self) -> None:
+        """No-op — connections are per-request."""
         self._available = False
-        await self._close_ws()
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-    async def _close_ws(self) -> None:
-        if self._ws is not None and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None

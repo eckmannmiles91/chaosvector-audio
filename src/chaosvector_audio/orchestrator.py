@@ -43,6 +43,19 @@ _DEVICE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Broader check for anything that might be a device/HA command
+_HA_CANDIDATE_RE = re.compile(
+    r"\b(?:turn|switch|toggle|open|close|lock|unlock|dim|brighten|set|increase|decrease"
+    r"|lights?|lamp|fan|thermostat|temperature|temp|heat|cool|ac|air"
+    r"|garage|door|blind|curtain|shade|volume)\b",
+    re.IGNORECASE,
+)
+
+
+def _might_be_device_cmd(text: str) -> bool:
+    """Quick check if text could be a device command worth sending to HA."""
+    return bool(_HA_CANDIDATE_RE.search(text))
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -271,12 +284,16 @@ class Orchestrator:
             log.info("barge-in: stopping playback")
             self._playback.barge_in()
 
-        # Play wake beep
+        # Play wake beep and wait for it to finish (max 500ms)
         await self._playback.enqueue(
             self._beep, sample_rate=22050,
             priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
         )
-        await asyncio.sleep(0.12)
+        beep_wait = 0
+        while self._playback.is_playing and beep_wait < 0.5:
+            await asyncio.sleep(0.02)
+            beep_wait += 0.02
+        await asyncio.sleep(0.05)  # small gap after beep
 
         # LISTENING
         utterance = await self._listen()
@@ -421,16 +438,19 @@ class Orchestrator:
             await self._respond_llm(transcript)
 
     async def _handle_general(self, transcript: str) -> None:
-        """Handle general intents: try HA first, fall back to LLM."""
-        # Try HA for anything that might be a device command
-        if self._ha.is_available:
+        """Handle general intents: try HA for device-like commands, else LLM."""
+        # Only try HA if it looks like it could be a device command
+        # (avoids wasting time sending "tell me a joke" to HA)
+        if self._ha.is_available and _might_be_device_cmd(transcript):
             response = await self._ha.run_intent(transcript)
-            if response and response.lower() not in ("sorry, i couldn't understand that",
-                                                      "sorry, i'm not sure how to help with that"):
+            if response and response.lower() not in (
+                "sorry, i couldn't understand that",
+                "sorry, i'm not sure how to help with that",
+            ):
                 await self._speak(response)
                 return
 
-        # HA didn't handle it — use LLM
+        # Not a device command or HA didn't handle it — use LLM
         await self._respond_llm(transcript)
 
     async def _respond_llm(self, transcript: str) -> None:
@@ -462,9 +482,8 @@ class Orchestrator:
         except Exception as e:
             log.error("LLM streaming error: %s", e, exc_info=True)
 
-        # Wait for playback to finish
-        while self._playback.is_playing:
-            await asyncio.sleep(0.05)
+        # Wait for playback to finish (max 30s to prevent hang)
+        await self._wait_playback(timeout=30.0)
 
         if sentence_count == 0:
             log.warning("LLM produced no response")
@@ -481,8 +500,16 @@ class Orchestrator:
                 priority=PlaybackPriority.TTS,
                 label="speak",
             )
-            while self._playback.is_playing:
-                await asyncio.sleep(0.05)
+            await self._wait_playback(timeout=15.0)
+
+    async def _wait_playback(self, timeout: float = 15.0) -> None:
+        """Wait for playback to finish with a timeout to prevent hangs."""
+        waited = 0.0
+        while self._playback.is_playing and waited < timeout:
+            await asyncio.sleep(0.05)
+            waited += 0.05
+        if waited >= timeout:
+            log.warning("playback wait timed out after %.1fs", timeout)
 
     # -- Echo gate -----------------------------------------------------------
 
@@ -530,12 +557,14 @@ class Orchestrator:
 # ---------------------------------------------------------------------------
 
 def _generate_beep(
-    frequency: float = 880, duration_ms: int = 80,
-    sample_rate: int = 22050, amplitude: float = 0.3,
+    frequency: float = 880, duration_ms: int = 150,
+    sample_rate: int = 22050, amplitude: float = 0.7,
 ) -> np.ndarray:
+    """Generate a clearly audible wake beep (880Hz, 150ms, 70% amplitude)."""
     t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000), endpoint=False)
     wave = amplitude * np.sin(2 * np.pi * frequency * t)
-    fade = int(sample_rate * 0.005)
+    # 10ms fade in/out to avoid clicks
+    fade = int(sample_rate * 0.010)
     wave[:fade] *= np.linspace(0, 1, fade)
     wave[-fade:] *= np.linspace(1, 0, fade)
     return (wave * 32767).astype(np.int16)

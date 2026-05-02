@@ -78,6 +78,7 @@ async def main() -> None:
         ha_ws_url="ws://10.1.1.53:8123/api/websocket",
         ha_http_url="http://10.1.1.53:8123",
         ha_token=ha_token,
+        ha_pipeline="01khmqpa5at2ps9qtcacrnnb12",
         ha_intent_timeout=10.0,
 
         # Context engine
