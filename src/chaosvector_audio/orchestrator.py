@@ -1,14 +1,19 @@
 """Pipeline orchestrator — ties wake, STT, intent, LLM, TTS, and playback together.
 
 This is the top-level daemon that replaces satellite.py. It imports the existing
-intent classifier and Ollama client from pi-fi-software and wires them into the
-new audio pipeline.
+intent classifier from pi-fi-software and integrates:
+- Local intent handling (time, weather, calendar via context engine)
+- HA device control (WebSocket intent execution)
+- LLM streaming (Gemma 4 via llama-server)
+- Echo gate (suppress wake during TTS playback)
+- Barge-in (wake during playback stops TTS)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,8 +27,21 @@ from chaosvector_audio.wake import WakeConfig, WakeWordClient
 from chaosvector_audio.stt import STTConfig, transcribe
 from chaosvector_audio.tts import TTSConfig, synthesize
 from chaosvector_audio.llm import LLMConfig, LLMClient
+from chaosvector_audio.context import ContextConfig, ContextClient, get_local_time
+from chaosvector_audio.ha import HAConfig, HAClient
 
 log = logging.getLogger(__name__)
+
+
+# Device command detection (same regex as satellite.py)
+_DEVICE_CMD_RE = re.compile(
+    r"\b(?:turn\s+(?:on|off)|switch\s+(?:on|off)|toggle"
+    r"|(?:open|close|lock|unlock)\s+the"
+    r"|dim\s+the|brighten\s+the"
+    r"|set\s+(?:the\s+)?(?:thermostat|temperature|temp)\b"
+    r"|(?:turn|switch)\s+(?:the\s+)?(?:heat|heating|cool(?:ing)?|ac|air)\s+(?:on|off))",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,17 +84,21 @@ class PipelineConfig:
     tts_voice: str = "af_heart"
     tts_timeout: float = 10.0
 
-    # Ollama / LLM
+    # LLM
     ollama_url: str = "http://10.1.1.228:8080"
-    ollama_model: str = "gemma4-e4b"
-    ollama_api_format: str = "openai"
     ollama_system_prompt_file: str = ""
     ollama_timeout: float = 15.0
     ollama_max_tokens: int = 120
 
-    # HA
-    ha_url: str = "http://10.1.1.53:8123"
+    # Home Assistant
+    ha_ws_url: str = "ws://10.1.1.53:8123/api/websocket"
+    ha_http_url: str = "http://10.1.1.53:8123"
     ha_token: str = ""
+    ha_pipeline: str | None = None
+    ha_intent_timeout: float = 10.0
+
+    # Context engine
+    context_url: str = "http://10.1.1.176:8400"
 
     # Follow-up
     follow_up_timeout: float = 5.0
@@ -84,7 +106,10 @@ class PipelineConfig:
     # Chime blanking
     chime_blanking_ms: int = 100
 
-    # Pi-Fi software path (for importing intent classifier etc.)
+    # Echo gate: suppress wake detection for this many ms after playback ends
+    echo_gate_ms: int = 300
+
+    # Pi-Fi software path (for importing intent classifier)
     pifi_path: str = "/home/chaos/pi-fi-software/voice"
 
 
@@ -93,7 +118,15 @@ class PipelineConfig:
 # ---------------------------------------------------------------------------
 
 class Orchestrator:
-    """Main pipeline orchestrator — IDLE → LISTENING → PROCESSING → RESPONDING loop."""
+    """Main pipeline orchestrator — IDLE → LISTENING → PROCESSING → RESPONDING loop.
+
+    Features:
+    - Local intent handling (time/weather/calendar via context engine)
+    - HA device control (WebSocket)
+    - LLM streaming with sentence-level TTS
+    - Echo gate (suppress wake during/after TTS)
+    - Barge-in (wake during playback stops TTS)
+    """
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -135,7 +168,7 @@ class Orchestrator:
             voice=config.tts_voice, timeout=config.tts_timeout,
         )
 
-        # LLM client (self-contained, no pi-fi dependency)
+        # LLM client
         system_prompt = ""
         if config.ollama_system_prompt_file:
             try:
@@ -149,7 +182,19 @@ class Orchestrator:
             system_prompt=system_prompt,
         ))
 
-        # Lazy-loaded components
+        # Context engine
+        self._context = ContextClient(ContextConfig(url=config.context_url))
+
+        # Home Assistant
+        self._ha = HAClient(HAConfig(
+            ws_url=config.ha_ws_url,
+            http_url=config.ha_http_url,
+            token=config.ha_token,
+            pipeline=config.ha_pipeline,
+            intent_timeout=config.ha_intent_timeout,
+        ))
+
+        # Lazy-loaded
         self._classifier = None
 
         # State
@@ -157,20 +202,21 @@ class Orchestrator:
         self._running = False
         self._interaction_count = 0
         self._beep = _generate_beep()
+        self._responding = False  # True while TTS is playing (echo gate)
+        self._last_playback_end: float = 0.0  # for echo gate tail
 
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Start all components and enter the main loop."""
-        # Import pi-fi components
+        """Start all components."""
         self._load_pifi_modules()
 
         await self._capture.open()
         await self._playback.start()
         await self._wake.start(self._wake_audio_queue)
-
-        # Connect LLM
         await self._llm.connect()
+        await self._context.connect()
+        await self._ha.connect()
 
         self._running = True
         log.info("orchestrator started")
@@ -181,10 +227,12 @@ class Orchestrator:
         await self._playback.stop()
         await self._capture.close()
         await self._llm.disconnect()
+        await self._context.disconnect()
+        await self._ha.disconnect()
         log.info("orchestrator stopped")
 
     async def run(self) -> None:
-        """Main loop — runs until cancelled or stop() called."""
+        """Main loop — runs until cancelled."""
         try:
             while self._running:
                 await self._idle_loop()
@@ -194,11 +242,12 @@ class Orchestrator:
     # -- IDLE ----------------------------------------------------------------
 
     async def _idle_loop(self) -> None:
-        """IDLE state: stream audio to wake word, wait for detection."""
+        """IDLE: stream audio to wake word, wait for detection.
+        Echo gate: skip wake detection while playing or within tail window."""
         log.info("=== IDLE ===")
         self._vad.reset()
 
-        # Feed audio to wake word detector
+        # Feed audio to wake word detector (with echo gate)
         feed_task = asyncio.create_task(self._feed_wake_audio())
         try:
             name, rms = await self._wake.wait_for_wake()
@@ -209,8 +258,18 @@ class Orchestrator:
             except asyncio.CancelledError:
                 pass
 
+        # Echo gate check: reject wake if we're still in the echo tail
+        if self._is_echo_active():
+            log.info("wake rejected (echo gate active)")
+            return
+
         self._interaction_count += 1
         log.info("WAKE #%d: '%s' (rms=%.1f)", self._interaction_count, name, rms)
+
+        # Barge-in: stop any current playback
+        if self._playback.is_playing:
+            log.info("barge-in: stopping playback")
+            self._playback.barge_in()
 
         # Play wake beep
         await self._playback.enqueue(
@@ -219,37 +278,39 @@ class Orchestrator:
         )
         await asyncio.sleep(0.12)
 
-        # Transition to LISTENING
+        # LISTENING
         utterance = await self._listen()
         if not utterance:
             self._wake.force_reconnect()
             await asyncio.sleep(0.3)
             return
 
-        # Transition to PROCESSING
+        # STT
         transcript = await self._process_stt(utterance)
         if not transcript:
             self._wake.force_reconnect()
             await asyncio.sleep(0.3)
             return
 
-        # Transition to RESPONDING
+        # RESPOND
         await self._respond(transcript)
 
-        # Clean up for next cycle
+        # Mark playback end for echo gate
+        self._last_playback_end = time.monotonic()
+
+        # Clean up
         self._wake.force_reconnect()
         await asyncio.sleep(0.3)
 
     # -- LISTENING -----------------------------------------------------------
 
     async def _listen(self) -> list[AudioChunk] | None:
-        """Collect utterance via VAD. Returns chunks or None on timeout/empty."""
+        """Collect utterance via VAD."""
         log.info("=== LISTENING ===")
         pre_roll = self._capture.drain_pre_roll()
         utterance: list[AudioChunk] = list(pre_roll)
         listen_start = time.monotonic()
 
-        # Chime blanking
         blanking_chunks = int(self.config.chime_blanking_ms / self.config.chunk_ms)
         blanked = 0
 
@@ -268,14 +329,14 @@ class Orchestrator:
         total_ms = sum(len(c.samples) for c in utterance) / self.config.sample_rate * 1000
         log.info("LISTENING done: %d chunks, %.0fms audio", len(utterance), total_ms)
 
-        if total_ms < 200:  # too short to be real speech
+        if total_ms < 200:
             return None
         return utterance
 
-    # -- PROCESSING ----------------------------------------------------------
+    # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
-        """Run STT on collected audio."""
+        """Run STT."""
         log.info("=== STT ===")
         transcript = await transcribe(chunks, self._stt_config)
         if transcript:
@@ -285,23 +346,91 @@ class Orchestrator:
     # -- RESPONDING ----------------------------------------------------------
 
     async def _respond(self, transcript: str) -> None:
-        """Classify intent and generate response."""
+        """Classify intent and route to appropriate handler."""
         log.info("=== RESPONDING ===")
+        self._responding = True
 
-        # Classify intent
-        intent_type = "general"
-        if self._classifier is not None:
-            try:
-                intents = self._classifier.classify_compound(transcript)
-                if intents:
-                    intent_type = intents[0].type.value
-                    log.info("Intent: %s (confidence=%.2f)", intent_type, intents[0].confidence)
-            except Exception as e:
-                log.warning("intent classification failed: %s", e)
+        try:
+            # Classify
+            intent_type = "general"
+            context_query = None
+            if self._classifier is not None:
+                try:
+                    intents = self._classifier.classify_compound(transcript)
+                    if intents:
+                        intent_type = intents[0].type.value
+                        context_query = getattr(intents[0], "context_query", None)
+                        log.info("Intent: %s (confidence=%.2f, context=%s)",
+                                 intent_type, intents[0].confidence, context_query)
+                except Exception as e:
+                    log.warning("intent classification failed: %s", e)
 
-        # For now: route everything through LLM for conversational response
-        # TODO: Add HA device control, music, timers, etc.
-        log.info("Routing to LLM (intent=%s)", intent_type)
+            # Route based on intent type
+            if intent_type == "simple_local":
+                await self._handle_simple_local(transcript, context_query)
+            elif intent_type == "general" and _DEVICE_CMD_RE.search(transcript):
+                await self._handle_ha_device(transcript)
+            elif intent_type == "general":
+                # Try HA first for device-like commands, fall back to LLM
+                await self._handle_general(transcript)
+            elif intent_type == "complex":
+                await self._respond_llm(transcript)
+            else:
+                # Music, timer, reminder, etc. — route to LLM for now
+                await self._respond_llm(transcript)
+
+        finally:
+            self._responding = False
+
+    async def _handle_simple_local(self, transcript: str, context_query: str | None) -> None:
+        """Handle simple_local intents: time, weather, calendar, presence."""
+        # Time is pure local — instant
+        if context_query == "time" or "time" in transcript.lower():
+            response = get_local_time()
+            log.info("Local time: %s", response)
+            await self._speak(response)
+            return
+
+        # Everything else: ask context engine
+        if context_query and self._context.is_available:
+            answer = await self._context.get_answer(context_query)
+            if answer:
+                log.info("Context answer (%s): %s", context_query, answer[:80])
+                await self._speak(answer)
+                return
+
+        # Fallback: try LLM
+        log.info("simple_local fallback to LLM (context_query=%s)", context_query)
+        await self._respond_llm(transcript)
+
+    async def _handle_ha_device(self, transcript: str) -> None:
+        """Handle device commands via HA."""
+        if not self._ha.is_available:
+            log.warning("HA not available, falling back to LLM")
+            await self._respond_llm(transcript)
+            return
+
+        log.info("Sending to HA: \"%s\"", transcript)
+        response = await self._ha.run_intent(transcript)
+
+        if response:
+            await self._speak(response)
+        else:
+            # HA failed — try LLM
+            log.info("HA returned no response, trying LLM")
+            await self._respond_llm(transcript)
+
+    async def _handle_general(self, transcript: str) -> None:
+        """Handle general intents: try HA first, fall back to LLM."""
+        # Try HA for anything that might be a device command
+        if self._ha.is_available:
+            response = await self._ha.run_intent(transcript)
+            if response and response.lower() not in ("sorry, i couldn't understand that",
+                                                      "sorry, i'm not sure how to help with that"):
+                await self._speak(response)
+                return
+
+        # HA didn't handle it — use LLM
         await self._respond_llm(transcript)
 
     async def _respond_llm(self, transcript: str) -> None:
@@ -313,7 +442,6 @@ class Orchestrator:
 
         log.info("Streaming from LLM...")
 
-        # Producer-consumer: LLM yields sentences, we synthesize and play each
         sentence_count = 0
         try:
             async for sentence in self._llm.generate_stream(transcript):
@@ -334,13 +462,13 @@ class Orchestrator:
         except Exception as e:
             log.error("LLM streaming error: %s", e, exc_info=True)
 
-        # Wait for all playback to finish
+        # Wait for playback to finish
         while self._playback.is_playing:
             await asyncio.sleep(0.05)
 
         if sentence_count == 0:
             log.warning("LLM produced no response")
-            await self._speak("Sorry, I didn't get a response from the language model.")
+            await self._speak("Sorry, I didn't get a response.")
 
     async def _speak(self, text: str) -> None:
         """Synthesize and play a single text response."""
@@ -356,11 +484,26 @@ class Orchestrator:
             while self._playback.is_playing:
                 await asyncio.sleep(0.05)
 
+    # -- Echo gate -----------------------------------------------------------
+
+    def _is_echo_active(self) -> bool:
+        """True if we're within the echo tail window after playback."""
+        if self._responding:
+            return True
+        if self._last_playback_end == 0.0:
+            return False
+        elapsed_ms = (time.monotonic() - self._last_playback_end) * 1000
+        return elapsed_ms < self.config.echo_gate_ms
+
     # -- helpers -------------------------------------------------------------
 
     async def _feed_wake_audio(self) -> None:
-        """Feed capture chunks to wake word queue."""
+        """Feed capture chunks to wake word queue.
+        Suppresses feeding during echo gate (prevents false wakes from TTS audio)."""
         async for chunk in self._capture.chunks():
+            # Echo gate: don't send audio to wake detector while playing
+            if self._is_echo_active():
+                continue
             raw = chunk.samples.astype(np.int16).tobytes()
             try:
                 self._wake_audio_queue.put_nowait(raw)
@@ -374,14 +517,12 @@ class Orchestrator:
         if pifi_path not in sys.path:
             sys.path.insert(0, pifi_path)
 
-        # Intent classifier has no relative imports — direct import works
         try:
             from intent_classifier import IntentClassifier
             self._classifier = IntentClassifier()
             log.info("intent classifier loaded")
         except ImportError as e:
             log.warning("intent classifier unavailable: %s", e)
-
 
 
 # ---------------------------------------------------------------------------
