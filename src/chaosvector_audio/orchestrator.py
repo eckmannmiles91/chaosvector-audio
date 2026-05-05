@@ -214,7 +214,8 @@ class Orchestrator:
         self._wake_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self._running = False
         self._interaction_count = 0
-        self._beep = _generate_beep()
+        self._beep = _load_wake_sound(config.pifi_path)
+        self._beep_rate = 44100  # wake.wav is 44100Hz
         self._responding = False  # True while TTS is playing (echo gate)
         self._last_playback_end: float = 0.0  # for echo gate tail
 
@@ -284,9 +285,9 @@ class Orchestrator:
             log.info("barge-in: stopping playback")
             self._playback.barge_in()
 
-        # Play wake beep and wait for it to finish (max 500ms)
+        # Play wake sound and wait for it to finish (max 500ms)
         await self._playback.enqueue(
-            self._beep, sample_rate=22050,
+            self._beep, sample_rate=self._beep_rate,
             priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
         )
         beep_wait = 0
@@ -556,15 +557,22 @@ class Orchestrator:
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _generate_beep(
-    frequency: float = 880, duration_ms: int = 150,
-    sample_rate: int = 22050, amplitude: float = 0.7,
-) -> np.ndarray:
-    """Generate a clearly audible wake beep (880Hz, 150ms, 70% amplitude)."""
-    t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000), endpoint=False)
-    wave = amplitude * np.sin(2 * np.pi * frequency * t)
-    # 10ms fade in/out to avoid clicks
-    fade = int(sample_rate * 0.010)
-    wave[:fade] *= np.linspace(0, 1, fade)
-    wave[-fade:] *= np.linspace(1, 0, fade)
-    return (wave * 32767).astype(np.int16)
+def _load_wake_sound(pifi_path: str) -> np.ndarray:
+    """Load wake.wav from pi-fi sounds directory, fallback to synthetic beep."""
+    import wave
+    wav_path = Path(pifi_path) / "sounds" / "wake.wav"
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+            log.info("loaded wake sound: %s (%d samples, %dHz)",
+                     wav_path, len(audio), wf.getframerate())
+            return audio
+    except Exception as e:
+        log.warning("wake.wav not found (%s), using synthetic beep", e)
+        rate = 22050
+        t = np.linspace(0, 0.15, int(rate * 0.15), endpoint=False)
+        w = 0.7 * np.sin(2 * np.pi * 600 * t)
+        fade = int(rate * 0.010)
+        w[:fade] *= np.linspace(0, 1, fade)
+        w[-fade:] *= np.linspace(1, 0, fade)
+        return (w * 32767).astype(np.int16)
