@@ -1,11 +1,15 @@
-"""Audio capture manager — ALSA/PipeWire mic capture with ring buffer."""
+"""Audio capture manager — ALSA/PipeWire mic capture with ring buffer.
+
+Uses a stdlib thread-safe queue for the sounddevice callback (which runs
+in a PortAudio thread), then bridges to asyncio in the consumer.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import collections
 import logging
-import math
+import queue
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -77,18 +81,24 @@ class CaptureConfig:
 
 
 class CaptureManager:
-    """Manages audio capture from ALSA/PipeWire and exposes an async stream."""
+    """Manages audio capture from ALSA/PipeWire and exposes an async stream.
+
+    The sounddevice callback runs in a PortAudio thread, so we use a
+    stdlib queue.Queue (thread-safe) as the bridge, then poll it from
+    the asyncio side.
+    """
 
     def __init__(self, config: CaptureConfig | None = None) -> None:
         self.config = config or CaptureConfig()
         self._stream = None                     # sounddevice.InputStream (lazy)
-        self._queue: asyncio.Queue[AudioChunk | None] = asyncio.Queue(maxsize=200)
+        self._thread_queue: queue.Queue = queue.Queue(maxsize=500)
         self._pre_roll = PreRollBuffer(
             self.config.pre_roll_ms,
             self.config.sample_rate,
             self.config.channels,
         )
         self._running = False
+        self._drop_count = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -100,6 +110,7 @@ class CaptureManager:
             self.config.sample_rate * self.config.chunk_duration_ms / 1000
         )
         self._running = True
+        self._drop_count = 0
 
         def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             if status:
@@ -115,9 +126,11 @@ class CaptureManager:
             )
             self._pre_roll.push(chunk)
             try:
-                self._queue.put_nowait(chunk)
-            except asyncio.QueueFull:
-                log.warning("capture queue full, dropping chunk")
+                self._thread_queue.put_nowait(chunk)
+            except queue.Full:
+                self._drop_count += 1
+                if self._drop_count % 500 == 1:
+                    log.warning("capture queue full, dropped %d chunks", self._drop_count)
 
         self._stream = sd.InputStream(
             device=self.config.device,
@@ -142,18 +155,20 @@ class CaptureManager:
             self._stream.stop()
             self._stream.close()
             self._stream = None
-        # Unblock any consumer waiting on the queue
-        await self._queue.put(None)
 
     # -- stream interface ----------------------------------------------------
 
     async def chunks(self) -> AsyncIterator[AudioChunk]:
-        """Yield audio chunks as they arrive from the capture device."""
+        """Yield audio chunks as they arrive from the capture device.
+
+        Polls the thread-safe queue from the asyncio event loop.
+        """
         while self._running:
-            chunk = await self._queue.get()
-            if chunk is None:
-                return
-            yield chunk
+            try:
+                chunk = self._thread_queue.get_nowait()
+                yield chunk
+            except queue.Empty:
+                await asyncio.sleep(0.005)  # 5ms poll interval
 
     def drain_pre_roll(self) -> list[AudioChunk]:
         """Return buffered pre-roll audio (call after wake word fires)."""
