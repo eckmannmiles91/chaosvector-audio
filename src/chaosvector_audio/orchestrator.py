@@ -311,10 +311,30 @@ class Orchestrator:
             return
 
         # RESPOND
-        await self._respond(transcript)
+        wants_followup = await self._respond(transcript)
 
         # Mark playback end for echo gate
         self._last_playback_end = time.monotonic()
+
+        # Follow-up mode: if the response was conversational, listen again
+        # without requiring re-wake (5s window)
+        while wants_followup and self._running:
+            log.info("=== FOLLOW-UP (%.0fs window) ===", self.config.follow_up_timeout)
+            # Brief pause for echo gate after TTS
+            await asyncio.sleep(0.3)
+
+            # Listen with follow-up timeout (shorter than normal)
+            utterance = await self._listen_followup()
+            if not utterance:
+                log.info("follow-up: no speech, returning to IDLE")
+                break
+
+            transcript = await self._process_stt(utterance)
+            if not transcript:
+                break
+
+            wants_followup = await self._respond(transcript)
+            self._last_playback_end = time.monotonic()
 
         # Clean up
         self._wake.force_reconnect()
@@ -351,6 +371,51 @@ class Orchestrator:
             return None
         return utterance
 
+    async def _listen_followup(self) -> list[AudioChunk] | None:
+        """Listen for follow-up speech without wake word.
+        Returns None if no speech within follow_up_timeout."""
+        self._vad.reset()
+        utterance: list[AudioChunk] = []
+        listen_start = time.monotonic()
+        speech_started = False
+
+        # Echo blanking: skip first 300ms (TTS echo tail)
+        blanking_chunks = int(300 / self.config.chunk_ms)
+        blanked = 0
+
+        async for chunk in self._capture.chunks():
+            if blanked < blanking_chunks:
+                blanked += 1
+                continue
+
+            elapsed = time.monotonic() - listen_start
+            state, end_of_speech = self._vad.process_frame(chunk.samples)
+
+            if not speech_started:
+                # Wait for speech within the follow-up window
+                if state.name == "SPEECH":
+                    speech_started = True
+                    utterance.append(chunk)
+                elif elapsed > self.config.follow_up_timeout:
+                    return None  # No speech within window
+            else:
+                utterance.append(chunk)
+                if end_of_speech:
+                    break
+                # Safety timeout once speech started
+                if elapsed > self.config.follow_up_timeout + self.config.listen_timeout:
+                    break
+
+        if not utterance:
+            return None
+
+        total_ms = sum(len(c.samples) for c in utterance) / self.config.sample_rate * 1000
+        log.info("FOLLOW-UP listen: %d chunks, %.0fms audio", len(utterance), total_ms)
+
+        if total_ms < 200:
+            return None
+        return utterance
+
     # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
@@ -363,10 +428,12 @@ class Orchestrator:
 
     # -- RESPONDING ----------------------------------------------------------
 
-    async def _respond(self, transcript: str) -> None:
-        """Classify intent and route to appropriate handler."""
+    async def _respond(self, transcript: str) -> bool:
+        """Classify intent and route to appropriate handler.
+        Returns True if follow-up listening is appropriate."""
         log.info("=== RESPONDING ===")
         self._responding = True
+        follow_up = False
 
         try:
             # Classify
@@ -389,16 +456,19 @@ class Orchestrator:
             elif intent_type == "general" and _DEVICE_CMD_RE.search(transcript):
                 await self._handle_ha_device(transcript)
             elif intent_type == "general":
-                # Try HA first for device-like commands, fall back to LLM
                 await self._handle_general(transcript)
+                follow_up = True  # conversational — listen for follow-up
             elif intent_type == "complex":
                 await self._respond_llm(transcript)
+                follow_up = True  # conversational — listen for follow-up
             else:
-                # Music, timer, reminder, etc. — route to LLM for now
                 await self._respond_llm(transcript)
+                follow_up = True
 
         finally:
             self._responding = False
+
+        return follow_up
 
     async def _handle_simple_local(self, transcript: str, context_query: str | None) -> None:
         """Handle simple_local intents: time, weather, calendar, presence."""

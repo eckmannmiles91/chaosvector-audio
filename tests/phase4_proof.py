@@ -42,8 +42,8 @@ async def main() -> None:
             pass
 
     config = PipelineConfig(
-        # Audio
-        mic_device=None,
+        # Audio — use ec_source for PipeWire AEC (echo-cancelled mic)
+        mic_device="ec_source",
         sample_rate=16000,
         channels=1,
         chunk_ms=20,
