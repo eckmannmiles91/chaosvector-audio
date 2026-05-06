@@ -316,10 +316,8 @@ class Orchestrator:
         # Mark playback end for echo gate
         self._last_playback_end = time.monotonic()
 
-        # Follow-up mode: disabled until AEC mic source is configured.
-        # Without echo cancellation, the follow-up listener picks up
-        # Jarvis's own TTS audio and creates a feedback loop.
-        wants_followup = False
+        # Follow-up mode: listen again after conversational responses
+        # Requires AEC mic source (ec_source) to avoid hearing own TTS
         while wants_followup and self._running:
             log.info("=== FOLLOW-UP (%.0fs window) ===", self.config.follow_up_timeout)
             # Brief pause for echo gate after TTS
@@ -354,15 +352,18 @@ class Orchestrator:
         blanking_chunks = int(self.config.chime_blanking_ms / self.config.chunk_ms)
         blanked = 0
 
+        min_listen_s = 1.0  # don't accept end-of-speech before 1s
+
         async for chunk in self._capture.chunks():
             if blanked < blanking_chunks:
                 blanked += 1
                 continue
             utterance.append(chunk)
             _, end_of_speech = self._vad.process_frame(chunk.samples)
-            if end_of_speech:
+            elapsed = time.monotonic() - listen_start
+            if end_of_speech and elapsed > min_listen_s:
                 break
-            if time.monotonic() - listen_start > self.config.listen_timeout:
+            if elapsed > self.config.listen_timeout:
                 log.warning("listen timeout")
                 break
 
@@ -375,45 +376,47 @@ class Orchestrator:
 
     async def _listen_followup(self) -> list[AudioChunk] | None:
         """Listen for follow-up speech without wake word.
-        Returns None if no speech within follow_up_timeout."""
+
+        Simple approach: wait for playback to end, then use normal VAD
+        listening with the standard _listen() method but with a shorter
+        timeout. The VAD handles speech detection the same way as after
+        a wake word.
+        """
+        # Wait for playback + echo to fully clear
+        while self._playback.is_playing:
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(1.5)  # let room reverb settle
+
+        # Drain any stale audio from the capture queue
+        while True:
+            try:
+                import queue as _q
+                self._capture._thread_queue.get_nowait()
+            except _q.Empty:
+                break
+
+        # Use normal listen with follow-up timeout
+        log.info("follow-up: listening for %.0fs...", self.config.follow_up_timeout)
         self._vad.reset()
         utterance: list[AudioChunk] = []
+        listen_start = time.monotonic()
         speech_started = False
 
-        # Wait for echo gate to clear (playback must be fully done + tail)
-        echo_wait = 0.0
-        while (self._playback.is_playing or self._is_echo_active()) and echo_wait < 3.0:
-            await asyncio.sleep(0.05)
-            echo_wait += 0.05
-
-        # Additional echo blanking: skip first 500ms after playback ends
-        # to let room reverb settle
-        await asyncio.sleep(0.5)
-
-        listen_start = time.monotonic()
-        blanking_chunks = 0
-        blanked = 0
-
         async for chunk in self._capture.chunks():
-            if blanked < blanking_chunks:
-                blanked += 1
-                continue
-
             elapsed = time.monotonic() - listen_start
-            state, end_of_speech = self._vad.process_frame(chunk.samples)
+
+            _, end_of_speech = self._vad.process_frame(chunk.samples)
 
             if not speech_started:
-                # Wait for speech within the follow-up window
-                if state.name == "SPEECH":
+                if self._vad._state.name == "SPEECH":
                     speech_started = True
                     utterance.append(chunk)
                 elif elapsed > self.config.follow_up_timeout:
-                    return None  # No speech within window
+                    return None  # timed out waiting for speech
             else:
                 utterance.append(chunk)
-                if end_of_speech:
+                if end_of_speech and elapsed > 1.5:  # min 1.5s after speech starts
                     break
-                # Safety timeout once speech started
                 if elapsed > self.config.follow_up_timeout + self.config.listen_timeout:
                     break
 
@@ -423,7 +426,7 @@ class Orchestrator:
         total_ms = sum(len(c.samples) for c in utterance) / self.config.sample_rate * 1000
         log.info("FOLLOW-UP listen: %d chunks, %.0fms audio", len(utterance), total_ms)
 
-        if total_ms < 200:
+        if total_ms < 300:
             return None
         return utterance
 

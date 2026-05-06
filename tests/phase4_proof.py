@@ -57,7 +57,7 @@ async def main() -> None:
 
         # VAD
         vad_aggressiveness=2,
-        silence_frames=20,
+        silence_frames=25,  # 500ms silence before end-of-speech (was 400ms)
 
         # STT (ChaosVector STT on microchaos3)
         stt_host="10.1.1.240",
