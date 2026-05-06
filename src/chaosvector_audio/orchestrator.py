@@ -35,6 +35,7 @@ from chaosvector_audio.speaker import SpeakerConfig, identify_speaker
 from chaosvector_audio.stt_filters import correct_stt, is_stt_garbage
 from chaosvector_audio.sounds import ThinkingIndicator, load_sound
 from chaosvector_audio.health import HealthReporter, HealthStatus
+from chaosvector_audio.wake_verify import WakeVerifier
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +141,10 @@ class PipelineConfig:
 
     # Sounds directory
     sounds_dir: str = "/home/chaos/pi-fi-software/voice/sounds"
+
+    # Wake verifier
+    wake_verifier_path: str = "/home/chaos/chaosvector-audio/model/wake_verifier.pkl"
+    wake_verifier_threshold: float = 0.5
 
     # Volume adaptation
     volume_adapt: bool = True
@@ -278,6 +283,11 @@ class Orchestrator:
         self._last_entities: list[str] = []  # entity names for pronoun resolution
         self._last_entity_ts: float = 0.0
 
+        # Wake verifier (speaker-specific filter)
+        self._wake_verifier = WakeVerifier(
+            config.wake_verifier_path, config.wake_verifier_threshold,
+        )
+
         # Health reporter
         self._health = HealthReporter(
             ha_url=config.ha_http_url, ha_token=config.ha_token,
@@ -364,8 +374,23 @@ class Orchestrator:
             log.info("wake rejected (echo gate active)")
             return
 
-        self._interaction_count += 1
         self._last_wake_rms = rms
+        log.info("WAKE candidate: '%s' (rms=%.1f)", name, rms)
+
+        # Verify wake word with speaker-specific model
+        if self._wake_verifier.is_available:
+            pre_roll = self._capture.drain_pre_roll()
+            if pre_roll:
+                verify_audio = np.concatenate([c.samples for c in pre_roll])
+                accepted, score = self._wake_verifier.verify(verify_audio)
+                if not accepted:
+                    log.info("wake rejected by verifier (score=%.3f)", score)
+                    return
+                # Re-push pre-roll since we drained it for verification
+                for c in pre_roll:
+                    self._capture._pre_roll.push(c)
+
+        self._interaction_count += 1
         log.info("WAKE #%d: '%s' (rms=%.1f)", self._interaction_count, name, rms)
 
         # Barge-in: stop any current playback

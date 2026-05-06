@@ -108,7 +108,8 @@ def main():
         print(f"  Resuming from clip {start_idx + 1} ({start_idx} already recorded)")
         print()
 
-    input("  Press Enter to begin...\n")
+    print("  Starting in 5 seconds...\n")
+    time.sleep(5)
 
     clip_idx = 0
     recorded = start_idx

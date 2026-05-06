@@ -98,6 +98,10 @@ async def main() -> None:
         # Sounds
         sounds_dir="/home/chaos/pi-fi-software/voice/sounds",
 
+        # Wake verifier
+        wake_verifier_path="/home/chaos/chaosvector-audio/model/wake_verifier.pkl",
+        wake_verifier_threshold=0.5,
+
         # Pi-Fi path for intent classifier import
         pifi_path="/home/chaos/pi-fi-software/voice",
     )
