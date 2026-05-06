@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiohttp
 import numpy as np
 
 from chaosvector_audio.capture import CaptureConfig, CaptureManager, AudioChunk
@@ -143,7 +144,17 @@ class PipelineConfig:
     volume_adapt_rms_low: int = 500
     volume_adapt_rms_high: int = 4000
 
-    # Pi-Fi software path (for importing intent classifier)
+    # Brief mode
+    brief_mode: bool = True
+    brief_min_frequency: int = 3
+    brief_top_n: int = 20
+
+    # AVR ducking
+    avr_enabled: bool = False
+    avr_device_name: str = ""
+    avr_restore_delay: float = 1.0
+
+    # Pi-Fi software path (for importing intent classifier + managers)
     pifi_path: str = "/home/chaos/pi-fi-software/voice"
 
 
@@ -239,8 +250,15 @@ class Orchestrator:
         # Thinking indicator
         self._thinking = ThinkingIndicator(self._playback, config.sounds_dir)
 
-        # Lazy-loaded
+        # Lazy-loaded from pi-fi-software
         self._classifier = None
+        self._timer_mgr = None
+        self._reminder_mgr = None
+        self._alarm_mgr = None
+
+        # Brief mode + routines
+        self._frequent_commands: set[str] = set()
+        self._routines: list[dict] = []
 
         # State
         self._wake_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
@@ -268,6 +286,12 @@ class Orchestrator:
         await self._llm.connect()
         await self._context.connect()
         await self._ha.connect()
+
+        # Restore persisted timers/reminders/alarms
+        await self._restore_scheduled()
+
+        # Sync routines and frequent commands from context engine
+        await self._sync_routines_and_brief()
 
         self._running = True
         log.info("orchestrator started")
@@ -519,10 +543,21 @@ class Orchestrator:
         response_text = ""
         route = ""
 
+        # AVR ducking
+        await self._duck_avr()
+
         # Volume adaptation
         self._apply_volume_adaptation()
 
         try:
+            # Check routines BEFORE intent classification (higher priority)
+            routine = self._match_routine(transcript)
+            if routine:
+                log.info("Routine matched: '%s'", routine.get("trigger", ""))
+                await self._run_routine(routine)
+                route = "routine"
+                return False  # no follow-up after routines
+
             # Classify
             intent_type = "general"
             context_query = None
@@ -559,8 +594,9 @@ class Orchestrator:
 
         finally:
             self._responding = False
-            # Restore normal volume
+            # Restore normal volume and AVR
             self._playback.set_volume(self._playback.config.volume)
+            await self._restore_avr()
 
             # Log interaction
             total_ms = (time.monotonic() - respond_start) * 1000
@@ -615,6 +651,17 @@ class Orchestrator:
         response = await self._ha.run_intent(transcript)
 
         if response:
+            # Brief mode: play chime instead of TTS for frequent commands
+            if self._is_brief_response(transcript, response):
+                from chaosvector_audio.sounds import load_sound
+                sound = load_sound("confirm", self.config.sounds_dir)
+                if sound is not None:
+                    audio, rate = sound
+                    await self._playback.enqueue(audio, sample_rate=rate,
+                                                 priority=PlaybackPriority.TTS, label="confirm")
+                    await self._wait_playback(timeout=3.0)
+                    log.info("brief mode: chime for '%s'", transcript[:40])
+                    return response
             await self._speak(response)
             return response
         else:
@@ -791,6 +838,180 @@ class Orchestrator:
             waited += 0.1
         return False
 
+    # -- Brief mode, routines, timers ----------------------------------------
+
+    _DEVICE_CONFIRMATIONS = {"Done.", "Got it.", "On it.", "All set.", "You got it.",
+                             "Turned on the light", "Turned off the light",
+                             "Turned on the lights", "Turned off the lights"}
+
+    def _is_brief_response(self, transcript: str, response: str) -> bool:
+        """Check if this device response should be a chime instead of TTS."""
+        if not self.config.brief_mode:
+            return False
+        if response not in self._DEVICE_CONFIRMATIONS:
+            return False
+        return self._is_frequent_command(transcript)
+
+    def _is_frequent_command(self, text: str) -> bool:
+        """Check if text matches a known frequent command."""
+        if not self._frequent_commands:
+            return False
+        text_lower = text.lower().strip()
+        text_words = set(text_lower.split())
+        if text_lower in {c.lower() for c in self._frequent_commands}:
+            return True
+        for cmd in self._frequent_commands:
+            cmd_words = set(cmd.lower().split())
+            if cmd_words and text_words:
+                overlap = len(text_words & cmd_words)
+                total = max(len(text_words), len(cmd_words))
+                if overlap / total >= 0.8:
+                    return True
+        return False
+
+    def _match_routine(self, text: str) -> dict | None:
+        """Check if spoken text matches a saved routine trigger."""
+        if not self._routines:
+            return None
+        text_lower = text.lower().strip()
+        text_words = set(text_lower.split())
+        best = None
+        best_score = 0.0
+        for r in self._routines:
+            trigger_lower = r["trigger"].lower().strip()
+            trigger_words = set(trigger_lower.split())
+            if text_lower == trigger_lower:
+                return r
+            if trigger_words and text_words:
+                overlap = len(text_words & trigger_words)
+                total = max(len(text_words), len(trigger_words))
+                ratio = overlap / total
+                if ratio >= 0.8 and ratio > best_score:
+                    best = r
+                    best_score = ratio
+        return best
+
+    async def _run_routine(self, routine: dict) -> None:
+        """Execute a routine's steps sequentially."""
+        steps = routine.get("steps", [])
+        log.info("Running routine '%s' (%d steps)", routine.get("trigger", ""), len(steps))
+        for i, step in enumerate(steps):
+            log.info("Routine step %d/%d: %s", i + 1, len(steps), step)
+            # Each step is processed as a normal transcript
+            await self._respond(step)
+            if i < len(steps) - 1:
+                await asyncio.sleep(0.3)
+
+    async def _restore_scheduled(self) -> None:
+        """Restore persisted reminders and alarms from disk."""
+        if self._reminder_mgr is not None:
+            try:
+                count = await self._reminder_mgr.load_and_schedule(self._on_reminder_fire)
+                if count:
+                    log.info("restored %d reminder(s)", count)
+            except Exception as e:
+                log.debug("reminder restore failed: %s", e)
+
+        if self._alarm_mgr is not None:
+            try:
+                count = await self._alarm_mgr.load_and_schedule(self._on_alarm_fire)
+                if count:
+                    log.info("restored %d alarm(s)", count)
+            except Exception as e:
+                log.debug("alarm restore failed: %s", e)
+
+    async def _on_timer_fire(self, label: str, duration: int) -> None:
+        """Callback when a timer expires."""
+        log.info("Timer fired: %s", label)
+        await self._speak(f"Your {label} timer is done." if label else "Timer is done.")
+
+    async def _on_reminder_fire(self, label: str) -> None:
+        """Callback when a reminder fires."""
+        log.info("Reminder fired: %s", label)
+        await self._speak(f"Reminder: {label}" if label else "You have a reminder.")
+
+    async def _on_alarm_fire(self, label: str) -> None:
+        """Callback when an alarm fires."""
+        log.info("Alarm fired: %s", label)
+        from chaosvector_audio.sounds import load_sound
+        sound = load_sound("alarm", self.config.sounds_dir)
+        if sound is not None:
+            audio, rate = sound
+            await self._playback.enqueue(audio, sample_rate=rate,
+                                         priority=PlaybackPriority.NOTIFICATION, label="alarm")
+        await self._speak(f"Alarm: {label}" if label else "Your alarm is going off.")
+
+    async def _sync_routines_and_brief(self) -> None:
+        """Sync routines and frequent commands from context engine."""
+        if not self._context.is_available:
+            return
+
+        # Routines
+        try:
+            routines = await self._context._session.get(
+                f"{self._context.config.url}/routine/list",
+                timeout=aiohttp.ClientTimeout(total=3.0),
+            )
+            async with routines as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._routines = data.get("routines", [])
+                    if self._routines:
+                        log.info("loaded %d routines", len(self._routines))
+        except Exception as e:
+            log.debug("routine sync failed: %s", e)
+
+        # Brief mode frequent commands
+        if self.config.brief_mode:
+            try:
+                import aiohttp as _aio
+                async with self._context._session.get(
+                    f"{self._context.config.url}/stats/frequent",
+                    params={"days": 7},
+                    timeout=_aio.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._frequent_commands = {
+                            item["stt_text"]
+                            for item in data[:self.config.brief_top_n]
+                            if item.get("count", 0) >= self.config.brief_min_frequency
+                            and item.get("intent_route") in (
+                                "ha_device", "ha_device_fast", "ha_entity_fuzzy", "ha",
+                            )
+                        }
+                        if self._frequent_commands:
+                            log.info("brief mode: %d frequent commands", len(self._frequent_commands))
+            except Exception as e:
+                log.debug("brief mode sync failed: %s", e)
+
+    async def _duck_avr(self) -> None:
+        """Mute AVR input during voice interaction."""
+        if not self.config.avr_enabled or not self.config.avr_device_name:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "wpctl", "set-mute", self.config.avr_device_name, "1",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception as e:
+            log.debug("AVR duck failed: %s", e)
+
+    async def _restore_avr(self) -> None:
+        """Unmute AVR input after voice interaction."""
+        if not self.config.avr_enabled or not self.config.avr_device_name:
+            return
+        await asyncio.sleep(self.config.avr_restore_delay)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "wpctl", "set-mute", self.config.avr_device_name, "0",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception as e:
+            log.debug("AVR restore failed: %s", e)
+
     # -- Volume adaptation ---------------------------------------------------
 
     def _apply_volume_adaptation(self) -> None:
@@ -835,7 +1056,7 @@ class Orchestrator:
                 pass
 
     def _load_pifi_modules(self) -> None:
-        """Import intent classifier from pi-fi-software."""
+        """Import intent classifier and managers from pi-fi-software."""
         import sys
         pifi_path = self.config.pifi_path
         if pifi_path not in sys.path:
@@ -847,6 +1068,27 @@ class Orchestrator:
             log.info("intent classifier loaded")
         except ImportError as e:
             log.warning("intent classifier unavailable: %s", e)
+
+        try:
+            from timer_manager import TimerManager
+            self._timer_mgr = TimerManager()
+            log.info("timer manager loaded")
+        except ImportError as e:
+            log.debug("timer manager unavailable: %s", e)
+
+        try:
+            from reminder_manager import ReminderManager
+            self._reminder_mgr = ReminderManager()
+            log.info("reminder manager loaded")
+        except ImportError as e:
+            log.debug("reminder manager unavailable: %s", e)
+
+        try:
+            from alarm_manager import AlarmManager
+            self._alarm_mgr = AlarmManager()
+            log.info("alarm manager loaded")
+        except ImportError as e:
+            log.debug("alarm manager unavailable: %s", e)
 
 
 # ---------------------------------------------------------------------------
