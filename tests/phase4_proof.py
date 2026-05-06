@@ -88,6 +88,16 @@ async def main() -> None:
         # Echo gate
         echo_gate_ms=300,
 
+        # Speaker verification
+        speaker_url="http://10.1.1.228:8500",
+        speaker_enabled=True,
+
+        # Feedback logging
+        feedback_dir="/var/lib/pi-fi/feedback",
+
+        # Sounds
+        sounds_dir="/home/chaos/pi-fi-software/voice/sounds",
+
         # Pi-Fi path for intent classifier import
         pifi_path="/home/chaos/pi-fi-software/voice",
     )

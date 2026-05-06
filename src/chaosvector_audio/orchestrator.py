@@ -29,6 +29,10 @@ from chaosvector_audio.tts import TTSConfig, synthesize
 from chaosvector_audio.llm import LLMConfig, LLMClient
 from chaosvector_audio.context import ContextConfig, ContextClient, get_local_time
 from chaosvector_audio.ha import HAConfig, HAClient
+from chaosvector_audio.feedback import FeedbackLogger
+from chaosvector_audio.speaker import SpeakerConfig, identify_speaker
+from chaosvector_audio.stt_filters import correct_stt, is_stt_garbage
+from chaosvector_audio.sounds import ThinkingIndicator
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +126,16 @@ class PipelineConfig:
     # Echo gate: suppress wake detection for this many ms after playback ends
     echo_gate_ms: int = 300
 
+    # Speaker verification
+    speaker_url: str = "http://10.1.1.228:8500"
+    speaker_enabled: bool = True
+
+    # Feedback logging
+    feedback_dir: str = "/var/lib/pi-fi/feedback"
+
+    # Sounds directory
+    sounds_dir: str = "/home/chaos/pi-fi-software/voice/sounds"
+
     # Pi-Fi software path (for importing intent classifier)
     pifi_path: str = "/home/chaos/pi-fi-software/voice"
 
@@ -207,11 +221,26 @@ class Orchestrator:
             intent_timeout=config.ha_intent_timeout,
         ))
 
+        # Feedback logger
+        self._feedback = FeedbackLogger(config.feedback_dir)
+
+        # Speaker verification
+        self._speaker_config = SpeakerConfig(
+            url=config.speaker_url, enabled=config.speaker_enabled,
+        )
+
+        # Thinking indicator
+        self._thinking = ThinkingIndicator(self._playback, config.sounds_dir)
+
         # Lazy-loaded
         self._classifier = None
 
         # State
         self._wake_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
+        self._speaker_name: str | None = None
+        self._last_wake_rms: float = 0.0
+        self._stt_ms: float = 0.0
+        self._stt_start: float = 0.0
         self._running = False
         self._interaction_count = 0
         self._beep = _load_wake_sound(config.pifi_path)
@@ -278,6 +307,7 @@ class Orchestrator:
             return
 
         self._interaction_count += 1
+        self._last_wake_rms = rms
         log.info("WAKE #%d: '%s' (rms=%.1f)", self._interaction_count, name, rms)
 
         # Barge-in: stop any current playback
@@ -433,12 +463,34 @@ class Orchestrator:
     # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
-        """Run STT."""
+        """Run STT with name corrections and hallucination filtering."""
         log.info("=== STT ===")
+        self._stt_start = time.monotonic()
         transcript = await transcribe(chunks, self._stt_config)
-        if transcript:
-            log.info("Transcript: \"%s\"", transcript)
+        self._stt_ms = (time.monotonic() - self._stt_start) * 1000
+
+        if not transcript:
+            return None
+
+        # Apply name corrections
+        transcript = correct_stt(transcript)
+
+        # Filter hallucinations
+        if is_stt_garbage(transcript):
+            log.info("STT garbage filtered: \"%s\"", transcript)
+            return None
+
+        log.info("Transcript: \"%s\"", transcript)
+
+        # Start speaker verification in background (uses first 3s of audio)
+        speaker_audio = np.concatenate([c.samples for c in chunks[:150]])  # ~3s
+        asyncio.create_task(self._identify_speaker(speaker_audio))
+
         return transcript
+
+    async def _identify_speaker(self, audio: np.ndarray) -> None:
+        """Background speaker identification."""
+        self._speaker_name = await identify_speaker(audio, self._speaker_config)
 
     # -- RESPONDING ----------------------------------------------------------
 
@@ -448,6 +500,9 @@ class Orchestrator:
         log.info("=== RESPONDING ===")
         self._responding = True
         follow_up = False
+        respond_start = time.monotonic()
+        response_text = ""
+        route = ""
 
         try:
             # Classify
@@ -466,32 +521,55 @@ class Orchestrator:
 
             # Route based on intent type
             if intent_type == "simple_local":
-                await self._handle_simple_local(transcript, context_query)
+                response_text = await self._handle_simple_local(transcript, context_query)
+                route = f"context:{context_query}" if context_query else "local"
             elif intent_type == "general" and _DEVICE_CMD_RE.search(transcript):
-                await self._handle_ha_device(transcript)
+                response_text = await self._handle_ha_device(transcript)
+                route = "ha"
             elif intent_type == "general":
                 await self._handle_general(transcript)
-                follow_up = True  # conversational — listen for follow-up
+                follow_up = True
+                route = "llm"
             elif intent_type == "complex":
                 await self._respond_llm(transcript)
-                follow_up = True  # conversational — listen for follow-up
+                follow_up = True
+                route = "llm"
             else:
                 await self._respond_llm(transcript)
                 follow_up = True
+                route = "llm"
 
         finally:
             self._responding = False
 
+            # Log interaction
+            total_ms = (time.monotonic() - respond_start) * 1000
+            try:
+                self._feedback.log_interaction(
+                    transcript=transcript,
+                    intent_type=intent_type,
+                    response_text=response_text or "",
+                    speaker=self._speaker_name,
+                    route=route,
+                    wake_rms=self._last_wake_rms,
+                    stt_ms=getattr(self, "_stt_ms", 0),
+                    total_ms=total_ms + getattr(self, "_stt_ms", 0),
+                    context_query=context_query,
+                )
+            except Exception as e:
+                log.debug("feedback log failed: %s", e)
+
         return follow_up
 
-    async def _handle_simple_local(self, transcript: str, context_query: str | None) -> None:
-        """Handle simple_local intents: time, weather, calendar, presence."""
+    async def _handle_simple_local(self, transcript: str, context_query: str | None) -> str:
+        """Handle simple_local intents: time, weather, calendar, presence.
+        Returns response text."""
         # Time is pure local — instant
         if context_query == "time" or "time" in transcript.lower():
             response = get_local_time()
             log.info("Local time: %s", response)
             await self._speak(response)
-            return
+            return response
 
         # Everything else: ask context engine
         if context_query and self._context.is_available:
@@ -499,28 +577,30 @@ class Orchestrator:
             if answer:
                 log.info("Context answer (%s): %s", context_query, answer[:80])
                 await self._speak(answer)
-                return
+                return answer
 
         # Fallback: try LLM
         log.info("simple_local fallback to LLM (context_query=%s)", context_query)
         await self._respond_llm(transcript)
+        return ""
 
-    async def _handle_ha_device(self, transcript: str) -> None:
-        """Handle device commands via HA."""
+    async def _handle_ha_device(self, transcript: str) -> str:
+        """Handle device commands via HA. Returns response text."""
         if not self._ha.is_available:
             log.warning("HA not available, falling back to LLM")
             await self._respond_llm(transcript)
-            return
+            return ""
 
         log.info("Sending to HA: \"%s\"", transcript)
         response = await self._ha.run_intent(transcript)
 
         if response:
             await self._speak(response)
+            return response
         else:
-            # HA failed — try LLM
             log.info("HA returned no response, trying LLM")
             await self._respond_llm(transcript)
+            return ""
 
     async def _handle_general(self, transcript: str) -> None:
         """Handle general intents: try HA for device-like commands, else LLM."""
@@ -548,6 +628,9 @@ class Orchestrator:
 
         log.info("Streaming from LLM...")
 
+        # Play thinking sound (cancelled when first audio plays)
+        await self._thinking.start()
+
         barged = False
         barge_feed = None
         sentence_count = 0
@@ -573,8 +656,10 @@ class Orchestrator:
                         priority=PlaybackPriority.TTS,
                         label=f"response-{sentence_count}",
                     )
+                    # Stop thinking sound before first audio plays
+                    if barge_feed is None:
+                        await self._thinking.stop()
                     # Start barge-in listener AFTER first sentence is queued
-                    # (avoids false wakes from residual audio)
                     if barge_feed is None:
                         self._wake.has_pending_wake()  # clear stale
                         barge_feed = asyncio.create_task(self._feed_wake_audio())
