@@ -136,6 +136,13 @@ class PipelineConfig:
     # Sounds directory
     sounds_dir: str = "/home/chaos/pi-fi-software/voice/sounds"
 
+    # Volume adaptation
+    volume_adapt: bool = True
+    volume_adapt_min: float = 0.25
+    volume_adapt_max: float = 0.85
+    volume_adapt_rms_low: int = 500
+    volume_adapt_rms_high: int = 4000
+
     # Pi-Fi software path (for importing intent classifier)
     pifi_path: str = "/home/chaos/pi-fi-software/voice"
 
@@ -239,6 +246,7 @@ class Orchestrator:
         self._wake_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self._speaker_name: str | None = None
         self._last_wake_rms: float = 0.0
+        self._speech_rms: float = 0.0
         self._stt_ms: float = 0.0
         self._stt_start: float = 0.0
         self._running = False
@@ -400,6 +408,13 @@ class Orchestrator:
         total_ms = sum(len(c.samples) for c in utterance) / self.config.sample_rate * 1000
         log.info("LISTENING done: %d chunks, %.0fms audio", len(utterance), total_ms)
 
+        # Compute average speech RMS for volume adaptation
+        if utterance:
+            rms_sum = sum(c.rms for c in utterance)
+            self._speech_rms = (rms_sum / len(utterance)) * 32768  # convert to int16 scale
+        else:
+            self._speech_rms = 0.0
+
         if total_ms < 200:
             return None
         return utterance
@@ -504,6 +519,9 @@ class Orchestrator:
         response_text = ""
         route = ""
 
+        # Volume adaptation
+        self._apply_volume_adaptation()
+
         try:
             # Classify
             intent_type = "general"
@@ -541,6 +559,8 @@ class Orchestrator:
 
         finally:
             self._responding = False
+            # Restore normal volume
+            self._playback.set_volume(self._playback.config.volume)
 
             # Log interaction
             total_ms = (time.monotonic() - respond_start) * 1000
@@ -605,7 +625,6 @@ class Orchestrator:
     async def _handle_general(self, transcript: str) -> None:
         """Handle general intents: try HA for device-like commands, else LLM."""
         # Only try HA if it looks like it could be a device command
-        # (avoids wasting time sending "tell me a joke" to HA)
         if self._ha.is_available and _might_be_device_cmd(transcript):
             response = await self._ha.run_intent(transcript)
             if response and response.lower() not in (
@@ -615,8 +634,49 @@ class Orchestrator:
                 await self._speak(response)
                 return
 
-        # Not a device command or HA didn't handle it — use LLM
-        await self._respond_llm(transcript)
+        # Not a device command or HA didn't handle it — use LLM with context
+        enriched = await self._enrich_prompt(transcript)
+        await self._respond_llm(enriched)
+
+    async def _enrich_prompt(self, transcript: str) -> str:
+        """Enrich the user's transcript with relevant context for the LLM.
+
+        Fetches relevant context from the context engine and prepends it
+        so the LLM can give informed answers about weather, calendar, etc.
+        """
+        if not self._context.is_available:
+            return transcript
+
+        try:
+            ctx = await self._context.get_relevant_context(
+                transcript, speaker=self._speaker_name,
+            )
+            if ctx:
+                # Build context block
+                parts = []
+                if "weather" in ctx:
+                    parts.append(f"[Weather] {ctx['weather']}")
+                if "calendar" in ctx:
+                    parts.append(f"[Calendar] {ctx['calendar']}")
+                if "presence" in ctx:
+                    parts.append(f"[Presence] {ctx['presence']}")
+                if "time" in ctx:
+                    parts.append(f"[Time] {ctx['time']}")
+                if "memories" in ctx:
+                    for m in ctx["memories"][:3]:
+                        parts.append(f"[Memory] {m.get('fact', '')}")
+
+                if self._speaker_name:
+                    parts.append(f"[Speaker: {self._speaker_name}]")
+
+                if parts:
+                    context_block = "\n".join(parts)
+                    log.info("Context enrichment: %d items", len(parts))
+                    return f"[Context]\n{context_block}\n\n{transcript}"
+        except Exception as e:
+            log.debug("context enrichment failed: %s", e)
+
+        return transcript
 
     async def _respond_llm(self, transcript: str) -> None:
         """Stream response from LLM with sentence-level TTS.
@@ -730,6 +790,22 @@ class Orchestrator:
             await asyncio.sleep(0.1)
             waited += 0.1
         return False
+
+    # -- Volume adaptation ---------------------------------------------------
+
+    def _apply_volume_adaptation(self) -> None:
+        """Scale playback volume based on how loud the user spoke."""
+        if not self.config.volume_adapt:
+            return
+        rms = self._speech_rms if self._speech_rms > 0 else self._last_wake_rms
+        if rms <= 0:
+            return
+        lo = self.config.volume_adapt_rms_low
+        hi = self.config.volume_adapt_rms_high
+        t = max(0.0, min(1.0, (rms - lo) / max(hi - lo, 1)))
+        vol = self.config.volume_adapt_min + t * (self.config.volume_adapt_max - self.config.volume_adapt_min)
+        log.info("Volume adapt: RMS=%.0f → volume=%.2f", rms, vol)
+        self._playback.set_volume(vol)
 
     # -- Echo gate -----------------------------------------------------------
 
