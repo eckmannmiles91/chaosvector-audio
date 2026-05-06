@@ -64,8 +64,8 @@ def _might_be_device_cmd(text: str) -> bool:
 @dataclass
 class PipelineConfig:
     """Unified config for the ChaosVector Audio pipeline."""
-    # Audio
-    mic_device: str | None = None
+    # Audio — default to XVF3800 hardware AEC output
+    mic_device: str | None = None  # None = PipeWire default; set to XVF3800 ALSA name for hardware AEC
     sample_rate: int = 16000
     channels: int = 1
     chunk_ms: int = 20

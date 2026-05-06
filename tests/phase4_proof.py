@@ -42,7 +42,7 @@ async def main() -> None:
             pass
 
     config = PipelineConfig(
-        # Audio — default PipeWire source (set WirePlumber default to ec_source for AEC)
+        # Audio — PipeWire default source = Pi-Fi Mic Array (XVF3800 hw AEC)
         mic_device=None,
         sample_rate=16000,
         channels=1,
@@ -53,7 +53,8 @@ async def main() -> None:
         wake_host="127.0.0.1",
         wake_port=10400,
         wake_names=["hey_jarvis"],
-        wake_energy_threshold=200.0,
+        wake_energy_threshold=275.0,
+        wake_gain=4.0,  # boost audio to openWakeWord (matches satellite.py)
 
         # VAD
         vad_aggressiveness=2,
