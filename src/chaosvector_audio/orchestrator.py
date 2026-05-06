@@ -582,17 +582,21 @@ class Orchestrator:
                     log.warning("TTS failed for sentence %d", sentence_count)
         except Exception as e:
             log.error("LLM streaming error: %s", e, exc_info=True)
-        finally:
-            if barge_feed is not None:
-                barge_feed.cancel()
-                try:
-                    await barge_feed
-                except asyncio.CancelledError:
-                    pass
 
         if not barged:
-            # Wait for playback, but check for barge-in while waiting
+            # Keep barge-in feed running during playback wait
+            if barge_feed is None:
+                self._wake.has_pending_wake()  # clear stale
+                barge_feed = asyncio.create_task(self._feed_wake_audio())
             barged = await self._wait_playback_with_bargein(timeout=30.0)
+
+        # Now clean up the barge-in feed
+        if barge_feed is not None:
+            barge_feed.cancel()
+            try:
+                await barge_feed
+            except asyncio.CancelledError:
+                pass
 
         if sentence_count == 0 and not barged:
             log.warning("LLM produced no response")
