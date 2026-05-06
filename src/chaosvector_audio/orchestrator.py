@@ -316,8 +316,10 @@ class Orchestrator:
         # Mark playback end for echo gate
         self._last_playback_end = time.monotonic()
 
-        # Follow-up mode: if the response was conversational, listen again
-        # without requiring re-wake (5s window)
+        # Follow-up mode: disabled until AEC mic source is configured.
+        # Without echo cancellation, the follow-up listener picks up
+        # Jarvis's own TTS audio and creates a feedback loop.
+        wants_followup = False
         while wants_followup and self._running:
             log.info("=== FOLLOW-UP (%.0fs window) ===", self.config.follow_up_timeout)
             # Brief pause for echo gate after TTS
@@ -376,11 +378,20 @@ class Orchestrator:
         Returns None if no speech within follow_up_timeout."""
         self._vad.reset()
         utterance: list[AudioChunk] = []
-        listen_start = time.monotonic()
         speech_started = False
 
-        # Echo blanking: skip first 300ms (TTS echo tail)
-        blanking_chunks = int(300 / self.config.chunk_ms)
+        # Wait for echo gate to clear (playback must be fully done + tail)
+        echo_wait = 0.0
+        while (self._playback.is_playing or self._is_echo_active()) and echo_wait < 3.0:
+            await asyncio.sleep(0.05)
+            echo_wait += 0.05
+
+        # Additional echo blanking: skip first 500ms after playback ends
+        # to let room reverb settle
+        await asyncio.sleep(0.5)
+
+        listen_start = time.monotonic()
+        blanking_chunks = 0
         blanked = 0
 
         async for chunk in self._capture.chunks():

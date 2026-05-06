@@ -29,6 +29,38 @@ class LLMConfig:
     system_prompt: str = ""
 
 
+# SYCL corruption detection — iGPU produces garbage when compute context degrades
+def _is_corrupted(text: str) -> bool:
+    """Detect SYCL iGPU corruption — garbage output that should never be spoken."""
+    if not text:
+        return False
+    # Non-ASCII in a response is suspicious (Jarvis only produces English)
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    if len(text) > 10 and non_ascii >= 3:
+        return True
+    # High density of special characters = garbage
+    special = sum(1 for c in text if c in "[]/:+@#{}\\<>|_")
+    if len(text) > 15 and special / len(text) > 0.1:
+        return True
+    # Repeated patterns
+    if re.search(r"(.{3,})\1{3,}", text):
+        return True
+    return False
+
+
+_HALLUCINATION_PATTERNS = [
+    re.compile(r"as an? (?:AI|language model|LLM|artificial intelligence)", re.I),
+    re.compile(r"I (?:don't|do not) have (?:access to|the ability to|real-time)", re.I),
+    re.compile(r"my (?:training|knowledge) (?:data |cutoff)", re.I),
+]
+
+_FALLBACK_RESPONSE = "I'm not sure about that. Try asking differently."
+
+
+def _is_hallucination(text: str) -> bool:
+    return any(p.search(text) for p in _HALLUCINATION_PATTERNS)
+
+
 # Abbreviations that should NOT trigger a sentence split
 _ABBREVS = re.compile(
     r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e|approx)\.\s*$",
@@ -102,6 +134,8 @@ class LLMClient:
         full_response: list[str] = []
         token_buffer = ""
         first_yielded = False
+        any_yielded = False
+        corruption = False
 
         try:
             async with self._session.post(
@@ -160,7 +194,15 @@ class LLMClient:
                             sentence = token_buffer[:pos].strip()
                             token_buffer = token_buffer[pos:]
                             if sentence:
+                                if _is_corrupted(sentence):
+                                    log.warning("SYCL corruption detected, aborting: %s", sentence[:60])
+                                    corruption = True
+                                    break
+                                if _is_hallucination(sentence):
+                                    log.info("filtered hallucination: %s", sentence[:60])
+                                    continue
                                 first_yielded = True
+                                any_yielded = True
                                 yield sentence
 
         except asyncio.TimeoutError:
@@ -168,10 +210,16 @@ class LLMClient:
         except (aiohttp.ClientError, OSError) as e:
             log.warning("LLM stream error: %s", e)
 
-        # Yield remaining buffer
-        remaining = token_buffer.strip()
-        if remaining:
-            yield remaining
+        # Yield remaining buffer (if not corrupted)
+        if not corruption:
+            remaining = token_buffer.strip()
+            if remaining and not _is_corrupted(remaining):
+                if not _is_hallucination(remaining):
+                    any_yielded = True
+                    yield remaining
+
+        if not any_yielded:
+            yield _FALLBACK_RESPONSE
 
         # Update history
         complete = "".join(full_response).strip()
