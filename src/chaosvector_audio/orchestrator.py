@@ -455,7 +455,8 @@ class Orchestrator:
         await self._respond_llm(transcript)
 
     async def _respond_llm(self, transcript: str) -> None:
-        """Stream response from LLM with sentence-level TTS."""
+        """Stream response from LLM with sentence-level TTS.
+        Supports barge-in: wake word during playback stops response."""
         if not self._llm.is_available:
             log.warning("LLM not available")
             await self._speak("I heard you, but I can't reach the language model right now.")
@@ -463,9 +464,19 @@ class Orchestrator:
 
         log.info("Streaming from LLM...")
 
+        barged = False
+        barge_feed = None
         sentence_count = 0
+
         try:
             async for sentence in self._llm.generate_stream(transcript):
+                # Check for barge-in after first sentence is playing
+                if barge_feed is not None and self._wake.has_pending_wake():
+                    log.info("barge-in detected during LLM stream")
+                    self._playback.barge_in()
+                    barged = True
+                    break
+
                 sentence_count += 1
                 log.info("LLM sentence %d: \"%s\"", sentence_count, sentence[:80])
 
@@ -478,22 +489,39 @@ class Orchestrator:
                         priority=PlaybackPriority.TTS,
                         label=f"response-{sentence_count}",
                     )
+                    # Start barge-in listener AFTER first sentence is queued
+                    # (avoids false wakes from residual audio)
+                    if barge_feed is None:
+                        self._wake.has_pending_wake()  # clear stale
+                        barge_feed = asyncio.create_task(self._feed_wake_audio())
                 else:
                     log.warning("TTS failed for sentence %d", sentence_count)
         except Exception as e:
             log.error("LLM streaming error: %s", e, exc_info=True)
+        finally:
+            if barge_feed is not None:
+                barge_feed.cancel()
+                try:
+                    await barge_feed
+                except asyncio.CancelledError:
+                    pass
 
-        # Wait for playback to finish (max 30s to prevent hang)
-        await self._wait_playback(timeout=30.0)
+        if not barged:
+            # Wait for playback, but check for barge-in while waiting
+            barged = await self._wait_playback_with_bargein(timeout=30.0)
 
-        if sentence_count == 0:
+        if sentence_count == 0 and not barged:
             log.warning("LLM produced no response")
             await self._speak("Sorry, I didn't get a response.")
 
     async def _speak(self, text: str) -> None:
-        """Synthesize and play a single text response."""
+        """Synthesize and play a single text response.
+        Supports barge-in during playback."""
         result = await synthesize(text, self._tts_config)
         if result is not None:
+            # Start barge-in listener during playback
+            self._wake.has_pending_wake()  # clear stale
+            barge_feed = asyncio.create_task(self._feed_wake_audio())
             await self._playback.enqueue(
                 result.audio,
                 sample_rate=result.sample_rate,
@@ -501,7 +529,12 @@ class Orchestrator:
                 priority=PlaybackPriority.TTS,
                 label="speak",
             )
-            await self._wait_playback(timeout=15.0)
+            await self._wait_playback_with_bargein(timeout=15.0)
+            barge_feed.cancel()
+            try:
+                await barge_feed
+            except asyncio.CancelledError:
+                pass
 
     async def _wait_playback(self, timeout: float = 15.0) -> None:
         """Wait for playback to finish with a timeout to prevent hangs."""
@@ -511,6 +544,19 @@ class Orchestrator:
             waited += 0.05
         if waited >= timeout:
             log.warning("playback wait timed out after %.1fs", timeout)
+
+    async def _wait_playback_with_bargein(self, timeout: float = 30.0) -> bool:
+        """Wait for playback, checking for barge-in every 100ms.
+        Returns True if barge-in occurred."""
+        waited = 0.0
+        while self._playback.is_playing and waited < timeout:
+            if self._wake.has_pending_wake():
+                log.info("barge-in: stopping playback")
+                self._playback.barge_in()
+                return True
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        return False
 
     # -- Echo gate -----------------------------------------------------------
 
@@ -527,10 +573,11 @@ class Orchestrator:
 
     async def _feed_wake_audio(self) -> None:
         """Feed capture chunks to wake word queue.
-        Suppresses feeding during echo gate (prevents false wakes from TTS audio)."""
+        Suppresses during echo tail (post-playback) but NOT during playback
+        itself — barge-in needs to hear the wake word during TTS."""
         async for chunk in self._capture.chunks():
-            # Echo gate: don't send audio to wake detector while playing
-            if self._is_echo_active():
+            # Only suppress during echo tail AFTER playback ends (not during)
+            if not self._responding and self._is_echo_active():
                 continue
             raw = chunk.samples.astype(np.int16).tobytes()
             try:

@@ -87,6 +87,13 @@ class WakeWordClient:
         await self._wake_event.wait()
         return self._wake_name, self._wake_rms
 
+    def has_pending_wake(self) -> bool:
+        """Non-blocking check if a wake event fired (for barge-in detection)."""
+        if self._wake_event.is_set():
+            self._wake_event.clear()
+            return True
+        return False
+
     def force_reconnect(self) -> None:
         """Force disconnect so next cycle gets a fresh connection.
         Call this after each interaction to prevent stale TCP state."""
