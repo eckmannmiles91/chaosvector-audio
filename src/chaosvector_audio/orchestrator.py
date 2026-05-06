@@ -33,9 +33,13 @@ from chaosvector_audio.ha import HAConfig, HAClient
 from chaosvector_audio.feedback import FeedbackLogger
 from chaosvector_audio.speaker import SpeakerConfig, identify_speaker
 from chaosvector_audio.stt_filters import correct_stt, is_stt_garbage
-from chaosvector_audio.sounds import ThinkingIndicator
+from chaosvector_audio.sounds import ThinkingIndicator, load_sound
+from chaosvector_audio.health import HealthReporter, HealthStatus
 
 log = logging.getLogger(__name__)
+
+# Conversation history timeout (clear LLM history after this many seconds idle)
+_CONVERSATION_TIMEOUT = 1800  # 30 minutes
 
 
 # Device command detection (same regex as satellite.py)
@@ -267,6 +271,17 @@ class Orchestrator:
         self._speech_rms: float = 0.0
         self._stt_ms: float = 0.0
         self._stt_start: float = 0.0
+
+        # Conversation tracking
+        self._last_interaction_time: float = 0.0
+        self._recent_interactions: list[tuple[str, str]] = []  # (transcript, response) last 3
+        self._last_entities: list[str] = []  # entity names for pronoun resolution
+        self._last_entity_ts: float = 0.0
+
+        # Health reporter
+        self._health = HealthReporter(
+            ha_url=config.ha_http_url, ha_token=config.ha_token,
+        )
         self._running = False
         self._interaction_count = 0
         self._beep = _load_wake_sound(config.pifi_path)
@@ -293,11 +308,15 @@ class Orchestrator:
         # Sync routines and frequent commands from context engine
         await self._sync_routines_and_brief()
 
+        # Health reporting to HA
+        await self._health.start(self._get_health_status)
+
         self._running = True
         log.info("orchestrator started")
 
     async def stop(self) -> None:
         self._running = False
+        await self._health.stop()
         await self._wake.stop()
         await self._playback.stop()
         await self._capture.close()
@@ -321,6 +340,13 @@ class Orchestrator:
         Echo gate: skip wake detection while playing or within tail window."""
         log.info("=== IDLE ===")
         self._vad.reset()
+
+        # Clear conversation history after idle timeout
+        if (self._last_interaction_time > 0
+                and time.monotonic() - self._last_interaction_time > _CONVERSATION_TIMEOUT):
+            self._llm.clear_history()
+            self._recent_interactions.clear()
+            log.info("conversation history cleared (idle >30min)")
 
         # Feed audio to wake word detector (with echo gate)
         feed_task = asyncio.create_task(self._feed_wake_audio())
@@ -550,6 +576,9 @@ class Orchestrator:
         self._apply_volume_adaptation()
 
         try:
+            # Resolve pronouns ("turn it off" → "turn off the office lights")
+            transcript = self._resolve_pronouns(transcript)
+
             # Check routines BEFORE intent classification (higher priority)
             routine = self._match_routine(transcript)
             if routine:
@@ -572,6 +601,14 @@ class Orchestrator:
                 except Exception as e:
                     log.warning("intent classification failed: %s", e)
 
+            # Compound commands: split "turn on lights and play music"
+            if self._classifier is not None and intents and len(intents) > 1:
+                log.info("Compound command: %d intents", len(intents))
+                for ci in intents:
+                    await self._respond(ci.text)
+                route = "compound"
+                return False
+
             # Route based on intent type
             if intent_type == "simple_local":
                 response_text = await self._handle_simple_local(transcript, context_query)
@@ -579,6 +616,7 @@ class Orchestrator:
             elif intent_type == "general" and _DEVICE_CMD_RE.search(transcript):
                 response_text = await self._handle_ha_device(transcript)
                 route = "ha"
+                self._track_entities(transcript)
             elif intent_type == "general":
                 await self._handle_general(transcript)
                 follow_up = True
@@ -592,11 +630,22 @@ class Orchestrator:
                 follow_up = True
                 route = "llm"
 
+        except Exception as e:
+            log.error("respond error: %s", e)
+            await self._play_error_sound()
+
         finally:
             self._responding = False
             # Restore normal volume and AVR
             self._playback.set_volume(self._playback.config.volume)
             await self._restore_avr()
+
+            # Track interaction
+            self._last_interaction_time = time.monotonic()
+            if response_text:
+                self._recent_interactions.append((transcript, response_text))
+                if len(self._recent_interactions) > 3:
+                    self._recent_interactions.pop(0)
 
             # Log interaction
             total_ms = (time.monotonic() - respond_start) * 1000
@@ -634,6 +683,41 @@ class Orchestrator:
                 log.info("Context answer (%s): %s", context_query, answer[:80])
                 await self._speak(answer)
                 return answer
+
+        # Context engine write operations
+        if self._context.is_available:
+            text_lower = transcript.lower()
+
+            # Shopping list
+            if "shopping list" in text_lower or "grocery" in text_lower:
+                if "add" in text_lower:
+                    item = re.sub(r".*(?:add|put)\s+", "", transcript, flags=re.I).strip()
+                    item = re.sub(r"\s+(?:to|on)\s+(?:the\s+)?(?:shopping|grocery).*", "", item, flags=re.I).strip()
+                    if item:
+                        result = await self._context_write("shopping/add", {"item": item})
+                        if result:
+                            await self._speak(result)
+                            return result
+
+            # Todo list
+            if "to do" in text_lower or "todo" in text_lower:
+                if "add" in text_lower:
+                    item = re.sub(r".*(?:add)\s+", "", transcript, flags=re.I).strip()
+                    item = re.sub(r"\s+(?:to|on)\s+(?:the\s+)?(?:to.?do).*", "", item, flags=re.I).strip()
+                    if item:
+                        result = await self._context_write("todo/add", {"item": item})
+                        if result:
+                            await self._speak(result)
+                            return result
+
+            # Memory ("remember that...")
+            if re.match(r"remember\s+(?:that\s+)?", text_lower):
+                fact = re.sub(r"^remember\s+(?:that\s+)?", "", transcript, flags=re.I).strip()
+                if fact:
+                    result = await self._context_write("memory/add", {"fact": fact})
+                    if result:
+                        await self._speak(result)
+                        return result
 
         # Fallback: try LLM
         log.info("simple_local fallback to LLM (context_query=%s)", context_query)
@@ -715,6 +799,11 @@ class Orchestrator:
 
                 if self._speaker_name:
                     parts.append(f"[Speaker: {self._speaker_name}]")
+
+                # Recent interactions for conversational context
+                if self._recent_interactions:
+                    for user_text, resp_text in self._recent_interactions[-2:]:
+                        parts.append(f"[Recent] User: {user_text[:60]} → {resp_text[:60]}")
 
                 if parts:
                     context_block = "\n".join(parts)
@@ -837,6 +926,83 @@ class Orchestrator:
             await asyncio.sleep(0.1)
             waited += 0.1
         return False
+
+    # -- Pronoun resolution, entity tracking, error sound --------------------
+
+    _PRONOUN_RE = re.compile(
+        r"\b(?:turn|switch|toggle|set)\s+(?:it|that|them|those)\s+(?:on|off|up|down)\b",
+        re.IGNORECASE,
+    )
+
+    def _resolve_pronouns(self, text: str) -> str:
+        """Replace pronouns with last controlled entity if available."""
+        if not self._last_entities:
+            return text
+        # Only resolve if entity context is fresh (<5 min)
+        if time.monotonic() - self._last_entity_ts > 300:
+            self._last_entities.clear()
+            return text
+        if self._PRONOUN_RE.search(text):
+            entity = self._last_entities[0]
+            resolved = self._PRONOUN_RE.sub(
+                lambda m: m.group().replace("it", entity).replace("that", entity)
+                    .replace("them", entity).replace("those", entity),
+                text,
+            )
+            log.info("pronoun resolved: \"%s\" → \"%s\"", text, resolved)
+            return resolved
+        return text
+
+    def _track_entities(self, transcript: str) -> None:
+        """Extract entity names from device commands for pronoun resolution."""
+        # Simple extraction: take everything after "turn on/off the"
+        m = re.search(r"(?:turn\s+(?:on|off)|toggle)\s+(?:the\s+)?(.+?)\.?$", transcript, re.I)
+        if m:
+            entity = m.group(1).strip()
+            self._last_entities = [entity]
+            self._last_entity_ts = time.monotonic()
+            log.debug("tracking entity: %s", entity)
+
+    async def _play_error_sound(self) -> None:
+        """Play error sound on failures."""
+        sound = load_sound("error", self.config.sounds_dir)
+        if sound is not None:
+            audio, rate = sound
+            await self._playback.enqueue(audio, sample_rate=rate,
+                                         priority=PlaybackPriority.NOTIFICATION, label="error")
+            await self._wait_playback(timeout=3.0)
+
+    async def _context_write(self, endpoint: str, data: dict) -> str | None:
+        """Write to context engine (shopping, todo, memory, preferences)."""
+        if not self._context.is_available:
+            return None
+        try:
+            async with self._context._session.post(
+                f"{self._context.config.url}/{endpoint}",
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return result.get("message", "Done.")
+        except Exception as e:
+            log.warning("context write (%s) failed: %s", endpoint, e)
+        return None
+
+    def _get_health_status(self) -> HealthStatus:
+        """Return current health status for HA sensor."""
+        return HealthStatus(
+            wake_word=self._wake.is_connected,
+            stt=True,  # per-request, always "available"
+            tts=True,
+            llm=self._llm.is_available,
+            context_engine=self._context.is_available,
+            ha=self._ha.is_available,
+            speaker_verify=self._speaker_config.enabled,
+            interactions=self._interaction_count,
+            last_interaction=time.strftime("%H:%M:%S",
+                time.localtime(self._last_interaction_time)) if self._last_interaction_time else "",
+        )
 
     # -- Brief mode, routines, timers ----------------------------------------
 
