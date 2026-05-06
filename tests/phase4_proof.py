@@ -53,7 +53,7 @@ async def main() -> None:
         wake_host="127.0.0.1",
         wake_port=10400,
         wake_names=["hey_jarvis"],
-        wake_energy_threshold=275.0,
+        wake_energy_threshold=320.0,
         wake_gain=4.0,  # boost audio to openWakeWord (matches satellite.py)
 
         # VAD
