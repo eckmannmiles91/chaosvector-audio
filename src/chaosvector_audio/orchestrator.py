@@ -377,21 +377,33 @@ class Orchestrator:
         self._last_wake_rms = rms
         log.info("WAKE candidate: '%s' (rms=%.1f)", name, rms)
 
-        # Verify wake word with speaker-specific model
+        # Verify wake word using pre-roll (contains the wake audio) + 1s more
         if self._wake_verifier.is_available:
             pre_roll = self._capture.drain_pre_roll()
-            if pre_roll:
-                verify_audio = np.concatenate([c.samples for c in pre_roll])
+            # Also capture 1 more second to get the full wake word
+            extra_chunks = []
+            extra_start = time.monotonic()
+            async for chunk in self._capture.chunks():
+                extra_chunks.append(chunk)
+                if time.monotonic() - extra_start > 1.0:
+                    break
+            all_chunks = (pre_roll or []) + extra_chunks
+            if all_chunks:
+                verify_audio = np.concatenate([c.samples for c in all_chunks])
                 accepted, score = self._wake_verifier.verify(verify_audio)
                 if not accepted:
                     log.info("wake rejected by verifier (score=%.3f)", score)
+                    # Re-push chunks for pre-roll
                     return
-                # Re-push pre-roll since we drained it for verification
-                for c in pre_roll:
+                # Re-push extra chunks into pre-roll for STT use
+                for c in extra_chunks:
                     self._capture._pre_roll.push(c)
 
         self._interaction_count += 1
         log.info("WAKE #%d: '%s' (rms=%.1f)", self._interaction_count, name, rms)
+
+        # Save wake audio for future verifier training
+        self._save_wake_audio()
 
         # Barge-in: stop any current playback
         if self._playback.is_playing:
@@ -951,6 +963,42 @@ class Orchestrator:
             await asyncio.sleep(0.1)
             waited += 0.1
         return False
+
+    # -- Wake audio collection -----------------------------------------------
+
+    def _save_wake_audio(self) -> None:
+        """Save pre-roll + 1s of post-wake audio for verifier training.
+        Captures through the live pipeline path so embeddings match."""
+        import wave as _wave
+        from datetime import datetime
+
+        try:
+            save_dir = Path("/home/chaos/wake-training/live")
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            # Use pre-roll audio (contains the wake word)
+            pre_roll = self._capture.drain_pre_roll()
+            if not pre_roll:
+                return
+
+            audio = np.concatenate([c.samples for c in pre_roll])
+
+            # Pad to at least 2.5s
+            target = int(self.config.sample_rate * 2.5)
+            if len(audio) < target:
+                audio = np.pad(audio, (0, target - len(audio)))
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = save_dir / f"wake_{ts}_{self._interaction_count:04d}.wav"
+            with _wave.open(str(path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.config.sample_rate)
+                wf.writeframes(audio[:target].tobytes())
+
+            log.debug("saved wake audio: %s", path.name)
+        except Exception as e:
+            log.debug("wake audio save failed: %s", e)
 
     # -- Pronoun resolution, entity tracking, error sound --------------------
 

@@ -98,8 +98,9 @@ async def main() -> None:
         # Sounds
         sounds_dir="/home/chaos/pi-fi-software/voice/sounds",
 
-        # Wake verifier
-        wake_verifier_path="/home/chaos/chaosvector-audio/model/wake_verifier.pkl",
+        # Wake verifier — disabled until embedding mismatch is resolved
+        # (training recordings don't match live capture path)
+        wake_verifier_path="",
         wake_verifier_threshold=0.5,
 
         # Pi-Fi path for intent classifier import
