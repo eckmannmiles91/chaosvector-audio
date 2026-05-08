@@ -410,16 +410,13 @@ class Orchestrator:
             log.info("barge-in: stopping playback")
             self._playback.barge_in()
 
-        # Play wake sound and wait for it to finish (max 500ms)
+        # Play wake sound at low volume (15%, matches satellite.py)
+        # Don't wait — play in background while listening starts
+        quiet_beep = (self._beep.astype(np.float64) * 0.15).astype(np.int16)
         await self._playback.enqueue(
-            self._beep, sample_rate=self._beep_rate,
+            quiet_beep, sample_rate=self._beep_rate,
             priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
         )
-        beep_wait = 0
-        while self._playback.is_playing and beep_wait < 0.5:
-            await asyncio.sleep(0.02)
-            beep_wait += 0.02
-        await asyncio.sleep(0.05)  # small gap after beep
 
         # LISTENING
         utterance = await self._listen()
