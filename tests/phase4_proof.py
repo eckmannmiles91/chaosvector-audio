@@ -85,6 +85,9 @@ async def main() -> None:
         # Context engine
         context_url="http://10.1.1.176:8400",
 
+        # Chime blanking — skip first 500ms of audio after beep (wake.wav + room reverb)
+        chime_blanking_ms=500,
+
         # Echo gate
         echo_gate_ms=300,
 

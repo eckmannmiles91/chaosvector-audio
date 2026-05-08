@@ -470,8 +470,10 @@ class Orchestrator:
     async def _listen(self) -> list[AudioChunk] | None:
         """Collect utterance via VAD."""
         log.info("=== LISTENING ===")
-        pre_roll = self._capture.drain_pre_roll()
-        utterance: list[AudioChunk] = list(pre_roll)
+        # Drain pre-roll but don't include it in the utterance —
+        # it contains the wake word audio which confuses STT
+        self._capture.drain_pre_roll()
+        utterance: list[AudioChunk] = []
         listen_start = time.monotonic()
 
         blanking_chunks = int(self.config.chime_blanking_ms / self.config.chunk_ms)
@@ -879,6 +881,12 @@ class Orchestrator:
 
                 sentence_count += 1
                 log.info("LLM sentence %d: \"%s\"", sentence_count, sentence[:80])
+
+                # Double-check for corruption (LLM filter may miss partial tokens)
+                from chaosvector_audio.llm import _is_corrupted
+                if _is_corrupted(sentence):
+                    log.warning("corruption caught at orchestrator, aborting response")
+                    break
 
                 result = await synthesize(sentence, self._tts_config)
                 if result is not None:
