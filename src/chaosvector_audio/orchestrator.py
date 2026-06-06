@@ -108,7 +108,8 @@ class PipelineConfig:
     tts_timeout: float = 10.0
 
     # LLM
-    ollama_url: str = "http://10.1.1.228:8080"
+    ollama_url: str = "http://10.1.1.104:11434"
+    ollama_model: str = "gemma4-12b-jarvis"
     ollama_system_prompt_file: str = ""
     ollama_timeout: float = 15.0
     ollama_max_tokens: int = 120
@@ -231,6 +232,7 @@ class Orchestrator:
                 pass
         self._llm = LLMClient(LLMConfig(
             url=config.ollama_url,
+            model=config.ollama_model,
             timeout=config.ollama_timeout,
             max_tokens=config.ollama_max_tokens,
             system_prompt=system_prompt,

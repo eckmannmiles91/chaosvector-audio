@@ -22,7 +22,8 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class LLMConfig:
-    url: str = "http://10.1.1.228:8080"
+    url: str = "http://10.1.1.104:11434"
+    model: str = "gemma4-12b-jarvis"
     timeout: float = 15.0
     max_tokens: int = 120
     temperature: float = 0.3
@@ -81,11 +82,25 @@ class LLMClient:
         """Check if llama-server is reachable."""
         self._session = aiohttp.ClientSession()
         try:
-            async with self._session.get(
-                f"{self.config.url}/health",
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                self._available = resp.status == 200
+            # Try /health (llama-server) then /v1/models (Ollama)
+            for endpoint in ["/health", "/v1/models"]:
+                try:
+                    async with self._session.get(
+                        f"{self.config.url}{endpoint}",
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            self._available = True
+                            break
+                except Exception:
+                    continue
+            if not self._available:
+                # Final fallback
+                async with self._session.get(
+                    f"{self.config.url}/v1/models",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    self._available = resp.status == 200
                 if self._available:
                     log.info("LLM connected: %s", self.config.url)
                 return self._available
@@ -125,6 +140,7 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         payload = {
+            "model": self.config.model,
             "messages": messages,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
