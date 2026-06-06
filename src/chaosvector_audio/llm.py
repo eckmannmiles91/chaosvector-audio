@@ -79,7 +79,7 @@ class LLMClient:
         self._history: deque[dict] = deque(maxlen=8)  # 4 turns
 
     async def connect(self) -> bool:
-        """Check if llama-server is reachable."""
+        """Check if LLM server is reachable (supports llama-server and Ollama)."""
         self._session = aiohttp.ClientSession()
         try:
             # Try /health (llama-server) then /v1/models (Ollama)
@@ -91,19 +91,12 @@ class LLMClient:
                     ) as resp:
                         if resp.status == 200:
                             self._available = True
-                            break
+                            log.info("LLM connected: %s (model=%s)", self.config.url, self.config.model)
+                            return True
                 except Exception:
                     continue
-            if not self._available:
-                # Final fallback
-                async with self._session.get(
-                    f"{self.config.url}/v1/models",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    self._available = resp.status == 200
-                if self._available:
-                    log.info("LLM connected: %s", self.config.url)
-                return self._available
+            log.warning("LLM not reachable at %s", self.config.url)
+            return False
         except Exception as e:
             log.warning("LLM health check failed: %s", e)
             self._available = False
