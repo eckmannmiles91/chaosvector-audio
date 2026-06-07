@@ -64,7 +64,11 @@ _HA_CANDIDATE_RE = re.compile(
 
 def _might_be_device_cmd(text: str) -> bool:
     """Quick check if text could be a device command worth sending to HA."""
-    return bool(_HA_CANDIDATE_RE.search(text))
+    # Must match a device keyword AND an action keyword
+    if not _HA_CANDIDATE_RE.search(text):
+        return False
+    # Require an action verb too — prevents "speed of light" matching
+    return bool(_DEVICE_CMD_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +460,13 @@ class Orchestrator:
             transcript = await self._process_stt(utterance)
             if not transcript:
                 break
+
+            # If user said the wake word again, treat as new interaction
+            if re.search(r"\bhey\s+jarvis\b", transcript, re.I):
+                log.info("follow-up: wake word detected, treating as new command")
+                transcript = re.sub(r"\bhey\s+jarvis\b[,.]?\s*", "", transcript, flags=re.I).strip()
+                if not transcript:
+                    break  # just said "hey Jarvis" with no command
 
             wants_followup = await self._respond(transcript)
             self._last_playback_end = time.monotonic()
