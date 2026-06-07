@@ -469,10 +469,15 @@ class Orchestrator:
     async def _listen(self) -> list[AudioChunk] | None:
         """Collect utterance via VAD."""
         log.info("=== LISTENING ===")
-        # Drain pre-roll but don't include it in the utterance —
-        # it contains the wake word audio which confuses STT
-        self._capture.drain_pre_roll()
+        # Include late pre-roll (speech that started during wake word)
+        # but skip the first 500ms (the wake word itself)
+        pre_roll = self._capture.drain_pre_roll()
         utterance: list[AudioChunk] = []
+        if pre_roll:
+            skip_chunks = int(500 / self.config.chunk_ms)  # skip ~500ms
+            late_chunks = pre_roll[skip_chunks:]
+            if late_chunks:
+                utterance.extend(late_chunks)
         listen_start = time.monotonic()
 
         blanking_chunks = int(self.config.chime_blanking_ms / self.config.chunk_ms)
