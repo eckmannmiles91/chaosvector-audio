@@ -69,9 +69,10 @@ async def main() -> None:
         tts_port=10210,
         tts_voice="af_heart",
 
-        # LLM (Gemma 4 12B on desktop RTX 3090 via Ollama)
-        ollama_url="http://10.1.1.104:11434",
-        ollama_system_prompt_file="",  # system prompt baked into Modelfile
+        # LLM (Gemma 4 E4B on microchaos2 iGPU via llama-server)
+        ollama_url="http://10.1.1.228:8080",
+        ollama_model="",  # llama-server serves single model, no name needed
+        ollama_system_prompt_file="/home/chaos/pi-fi-software/voice/system_prompt_phase1b.txt",
         ollama_timeout=15.0,
         ollama_max_tokens=120,
 

@@ -77,6 +77,7 @@ class LLMClient:
         self._session: aiohttp.ClientSession | None = None
         self._available = False
         self._history: deque[dict] = deque(maxlen=8)  # 4 turns
+        self._use_ollama_api = False  # True = /api/chat (Ollama), False = /v1/chat/completions (llama-server)
 
     async def connect(self) -> bool:
         """Check if LLM server is reachable (supports llama-server and Ollama)."""
@@ -91,7 +92,10 @@ class LLMClient:
                     ) as resp:
                         if resp.status == 200:
                             self._available = True
-                            log.info("LLM connected: %s (model=%s)", self.config.url, self.config.model)
+                            self._use_ollama_api = (endpoint == "/v1/models")
+                            api = "Ollama" if self._use_ollama_api else "llama-server"
+                            log.info("LLM connected: %s (%s, model=%s)",
+                                     self.config.url, api, self.config.model)
                             return True
                 except Exception:
                     continue
@@ -132,13 +136,27 @@ class LLMClient:
         messages.extend(self._history)
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self.config.model,
-            "messages": messages,
-            "max_tokens": self.config.max_tokens,
-            "temperature": self.config.temperature,
-            "stream": True,
-        }
+        if self._use_ollama_api:
+            payload = {
+                "model": self.config.model,
+                "messages": messages,
+                "stream": True,
+                "think": False,
+                "options": {
+                    "num_predict": self.config.max_tokens,
+                    "temperature": self.config.temperature,
+                },
+            }
+            api_url = f"{self.config.url}/api/chat"
+        else:
+            payload = {
+                "model": self.config.model or "default",
+                "messages": messages,
+                "max_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
+                "stream": True,
+            }
+            api_url = f"{self.config.url}/v1/chat/completions"
 
         full_response: list[str] = []
         token_buffer = ""
@@ -148,8 +166,7 @@ class LLMClient:
 
         try:
             async with self._session.post(
-                f"{self.config.url}/v1/chat/completions",
-                json=payload,
+                api_url, json=payload,
                 timeout=aiohttp.ClientTimeout(total=self.config.timeout),
             ) as resp:
                 if resp.status != 200:
@@ -163,31 +180,39 @@ class LLMClient:
                     line = raw_line.strip()
                     if not line:
                         continue
-                    # SSE format: "data: {...}" or "data: [DONE]"
-                    if line.startswith(b":"):
-                        continue
-                    if line.startswith(b"data: "):
-                        line = line[6:]
-                    elif line.startswith(b"data:"):
-                        line = line[5:]
+
+                    if self._use_ollama_api:
+                        # Ollama NDJSON: each line is a JSON object
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = data.get("message", {}).get("content", "")
+                        if data.get("done", False):
+                            break
                     else:
-                        continue
-                    if line == b"[DONE]":
-                        break
-
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Extract token
-                    choices = data.get("choices", [])
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    token = delta.get("content", "")
-                    if choices[0].get("finish_reason") is not None:
-                        break
+                        # OpenAI SSE: "data: {...}" or "data: [DONE]"
+                        if line.startswith(b":"):
+                            continue
+                        if line.startswith(b"data: "):
+                            line = line[6:]
+                        elif line.startswith(b"data:"):
+                            line = line[5:]
+                        else:
+                            continue
+                        if line == b"[DONE]":
+                            break
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if choices[0].get("finish_reason") is not None:
+                            break
 
                     if token:
                         token_buffer += token
