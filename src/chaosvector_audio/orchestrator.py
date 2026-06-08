@@ -596,22 +596,29 @@ class Orchestrator:
     # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
-        """Run STT with fast path for device commands, then full STT fallback."""
+        """Run S2P and full STT in parallel — use whichever wins."""
         log.info("=== STT ===")
         self._stt_start = time.monotonic()
 
-        # Try Speech-to-Phrase first (constrained, fast, no garbling)
-        fast_result = await transcribe_fast(chunks, self._fast_stt_config)
+        # Run both in parallel
+        fast_task = asyncio.create_task(transcribe_fast(chunks, self._fast_stt_config))
+        full_task = asyncio.create_task(transcribe(chunks, self._stt_config))
+
+        # Wait for both to complete (both are fast, <1s typically)
+        fast_result, full_result = await asyncio.gather(fast_task, full_task)
+
+        self._stt_ms = (time.monotonic() - self._stt_start) * 1000
+
+        # Prefer S2P if it matched (exact entity names, no garbling)
         if fast_result:
-            self._stt_ms = (time.monotonic() - self._stt_start) * 1000
-            log.info("Fast STT matched: \"%s\" (%.0fms)", fast_result, self._stt_ms)
-            # Start speaker verification in background
+            log.info("STT parallel: S2P matched \"%s\", full got \"%s\" (%.0fms)",
+                     fast_result, full_result or "", self._stt_ms)
             speaker_audio = np.concatenate([c.samples for c in chunks[:150]])
             asyncio.create_task(self._identify_speaker(speaker_audio))
             return fast_result
 
-        # Fall back to full STT
-        transcript = await transcribe(chunks, self._stt_config)
+        # S2P didn't match — use full STT result
+        transcript = full_result
         self._stt_ms = (time.monotonic() - self._stt_start) * 1000
 
         if not transcript:
