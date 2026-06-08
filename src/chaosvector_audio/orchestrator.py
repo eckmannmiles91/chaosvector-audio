@@ -48,9 +48,10 @@ _CONVERSATION_TIMEOUT = 1800  # 30 minutes
 _DEVICE_CMD_RE = re.compile(
     r"\b(?:turn\s+(?:on|off)|switch\s+(?:on|off)|toggle"
     r"|(?:open|close|lock|unlock)\s+the"
-    r"|dim\s+the|brighten\s+the"
+    r"|dim\s+(?:the\s+)?\w+|brighten\s+(?:the\s+)?\w+"
     r"|set\s+(?:the\s+)?(?:thermostat|temperature|temp)\b"
-    r"|(?:turn|switch)\s+(?:the\s+)?(?:heat|heating|cool(?:ing)?|ac|air)\s+(?:on|off))",
+    r"|(?:turn|switch)\s+(?:the\s+)?(?:heat|heating|cool(?:ing)?|ac|air)\s+(?:on|off)"
+    r"|\b\d+\s*%)",  # "to 20%" anywhere in the command
     re.IGNORECASE,
 )
 
