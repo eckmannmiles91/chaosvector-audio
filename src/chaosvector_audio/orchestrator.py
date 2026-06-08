@@ -34,6 +34,7 @@ from chaosvector_audio.feedback import FeedbackLogger
 from chaosvector_audio.speaker import SpeakerConfig, identify_speaker
 from chaosvector_audio.stt_filters import correct_stt, is_stt_garbage
 from chaosvector_audio.sounds import ThinkingIndicator, load_sound
+from chaosvector_audio.tts_cache import TTSCache, prewarm_cache
 from chaosvector_audio.health import HealthReporter, HealthStatus
 from chaosvector_audio.wake_verify import WakeVerifier
 from chaosvector_audio.stt_fast import FastSTTConfig, transcribe_fast
@@ -272,6 +273,9 @@ class Orchestrator:
         # Thinking indicator
         self._thinking = ThinkingIndicator(self._playback, config.sounds_dir)
 
+        # TTS cache
+        self._tts_cache = TTSCache(max_size=200)
+
         # Lazy-loaded from pi-fi-software
         self._classifier = None
         self._timer_mgr = None
@@ -337,6 +341,9 @@ class Orchestrator:
 
         # Sync routines and frequent commands from context engine
         await self._sync_routines_and_brief()
+
+        # Pre-warm TTS cache (runs in background)
+        asyncio.create_task(prewarm_cache(self._tts_cache, synthesize, self._tts_config))
 
         # Health reporting to HA
         await self._health.start(self._get_health_status)
@@ -936,7 +943,19 @@ class Orchestrator:
                     log.warning("corruption caught at orchestrator, aborting response")
                     break
 
-                result = await synthesize(sentence, self._tts_config)
+                # Check TTS cache first
+                cached = self._tts_cache.get(sentence)
+                if cached:
+                    log.info("TTS cache hit: \"%s\"", sentence[:40])
+                    result = type('R', (), {
+                        'audio': cached.audio, 'sample_rate': cached.sample_rate,
+                        'channels': cached.channels, 'duration_ms': cached.duration_ms,
+                    })()
+                else:
+                    result = await synthesize(sentence, self._tts_config)
+                    if result is not None:
+                        self._tts_cache.put(sentence, result.audio, result.sample_rate,
+                                            result.channels, result.duration_ms)
                 if result is not None:
                     await self._playback.enqueue(
                         result.audio,
@@ -978,8 +997,21 @@ class Orchestrator:
 
     async def _speak(self, text: str) -> None:
         """Synthesize and play a single text response.
-        Supports barge-in during playback."""
-        result = await synthesize(text, self._tts_config)
+        Checks TTS cache first for instant playback."""
+        # Check cache first
+        cached = self._tts_cache.get(text)
+        if cached:
+            log.info("TTS cache hit: \"%s\"", text[:60])
+            result = type('R', (), {
+                'audio': cached.audio, 'sample_rate': cached.sample_rate,
+                'channels': cached.channels, 'duration_ms': cached.duration_ms,
+            })()
+        else:
+            result = await synthesize(text, self._tts_config)
+            # Store in cache for next time
+            if result is not None:
+                self._tts_cache.put(text, result.audio, result.sample_rate,
+                                    result.channels, result.duration_ms)
         if result is not None:
             # Start barge-in listener during playback
             self._wake.has_pending_wake()  # clear stale

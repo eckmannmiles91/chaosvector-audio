@@ -1,0 +1,15 @@
+[Unit]
+Description=Wyoming openWakeWord — Wake Word Detection
+Before=chaosvector-audio.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chaos/wyoming-openwakeword
+ExecStart=/home/chaos/wyoming-openwakeword/.venv/bin/python -m wyoming_openwakeword --uri tcp://127.0.0.1:10400 --preload-model hey_jarvis --threshold 0.40 --trigger-level 1
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/home/chaos/logs/wyoming-openwakeword.log
+StandardError=append:/home/chaos/logs/wyoming-openwakeword.log
+
+[Install]
+WantedBy=default.target

@@ -1,12 +1,13 @@
 [Unit]
 Description=ChaosVector Audio — Voice Pipeline Daemon
 After=network.target pipewire.service wyoming-openwakeword.service
-Wants=pipewire.service
+Wants=pipewire.service wyoming-openwakeword.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/chaos/chaosvector-audio
-ExecStart=/home/chaos/pi-fi-software/voice/.venv/bin/python tests/phase4_proof.py
+Environment=PYTHONPATH=/home/chaos/chaosvector-audio/src
+ExecStart=/home/chaos/pi-fi-software/voice/.venv/bin/python -m chaosvector_audio --config /home/chaos/chaosvector-audio/config.yaml
 EnvironmentFile=/home/chaos/pi-fi-software/.env
 Restart=on-failure
 RestartSec=5

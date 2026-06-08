@@ -16,6 +16,8 @@ authors = [
 dependencies = [
     "numpy>=1.26",
     "sounddevice>=0.4",
+    "PyYAML>=6",
+    "aiohttp>=3",
 ]
 
 [project.optional-dependencies]

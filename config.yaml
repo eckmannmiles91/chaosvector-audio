@@ -1,0 +1,98 @@
+# ChaosVector Audio — Pipeline Configuration
+# Pi-Fi Smart Speaker Voice Daemon
+
+audio:
+  mic_device: null          # PipeWire default (Pi-Fi Mic Array via XVF3800 hw AEC)
+  sample_rate: 16000
+  channels: 1
+  chunk_ms: 20
+  pre_roll_ms: 500
+  playback_device: null     # PipeWire default (crossover → speaker)
+  playback_rate: 22050
+
+wake_word:
+  host: "127.0.0.1"
+  port: 10400
+  names: ["hey_jarvis"]
+  energy_threshold: 320
+  gain: 4.0                 # boost audio to openWakeWord (matches satellite.py)
+
+vad:
+  aggressiveness: 2
+  silence_frames: 25        # 500ms silence = end of speech
+  min_speech_frames: 3
+  listen_timeout: 10.0
+
+chime_blanking_ms: 500      # skip audio after wake beep (room reverb)
+echo_gate_ms: 300           # suppress wake detection after playback
+
+stt:
+  host: "10.1.1.240"
+  port: 10301               # ChaosVector STT (distil-whisper on NPU)
+  timeout: 10.0
+
+fast_stt:
+  host: "10.1.1.53"
+  port: 10302               # Speech-to-Phrase (HA add-on, constrained recognition)
+  enabled: true
+
+tts:
+  host: "10.1.1.240"
+  port: 10210               # ChaosVector TTS (Kokoro ONNX)
+  voice: "af_heart"
+  timeout: 10.0
+  piper_model: "/home/chaos/piper-models/en_US-lessac-medium.onnx"
+  piper_enabled: true
+
+llm:
+  url: "http://10.1.1.228:8080"  # Gemma 4 E4B on microchaos2 iGPU (llama-server)
+  model: ""                       # llama-server serves single model
+  system_prompt_file: "/home/chaos/pi-fi-software/voice/system_prompt_phase1b.txt"
+  timeout: 15.0
+  max_tokens: 120
+
+home_assistant:
+  ws_url: "ws://10.1.1.53:8123/api/websocket"
+  http_url: "http://10.1.1.53:8123"
+  token: "${HA_TOKEN}"            # resolved from environment
+  pipeline: "01khmqpa5at2ps9qtcacrnnb12"
+  intent_timeout: 10.0
+
+context_engine:
+  url: "http://10.1.1.176:8400"
+
+speaker_verify:
+  url: "http://10.1.1.228:8500"
+  enabled: true
+
+follow_up:
+  timeout: 5.0
+
+volume_adapt:
+  enabled: true
+  min: 0.25
+  max: 0.85
+  rms_low: 500
+  rms_high: 4000
+
+brief_mode:
+  enabled: true
+  min_frequency: 3
+  top_n: 20
+
+avr:
+  enabled: false
+  device_name: ""
+  restore_delay: 1.0
+
+wake_verifier:
+  path: ""                  # disabled — training data doesn't match live capture path
+  threshold: 0.5
+
+feedback:
+  dir: "/var/lib/pi-fi/feedback"
+
+sounds:
+  dir: "/home/chaos/pi-fi-software/voice/sounds"
+
+pifi_path: "/home/chaos/pi-fi-software/voice"
