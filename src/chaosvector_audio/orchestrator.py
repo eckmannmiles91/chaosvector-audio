@@ -36,6 +36,7 @@ from chaosvector_audio.stt_filters import correct_stt, is_stt_garbage
 from chaosvector_audio.sounds import ThinkingIndicator, load_sound
 from chaosvector_audio.health import HealthReporter, HealthStatus
 from chaosvector_audio.wake_verify import WakeVerifier
+from chaosvector_audio.stt_fast import FastSTTConfig, transcribe_fast
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +151,11 @@ class PipelineConfig:
     # Wake verifier
     wake_verifier_path: str = "/home/chaos/chaosvector-audio/model/wake_verifier.pkl"
     wake_verifier_threshold: float = 0.5
+
+    # Speech-to-Phrase fast path
+    fast_stt_host: str = "10.1.1.53"
+    fast_stt_port: int = 10302
+    fast_stt_enabled: bool = True
 
     # Volume adaptation
     volume_adapt: bool = True
@@ -288,6 +294,13 @@ class Orchestrator:
         self._recent_interactions: list[tuple[str, str]] = []  # (transcript, response) last 3
         self._last_entities: list[str] = []  # entity names for pronoun resolution
         self._last_entity_ts: float = 0.0
+
+        # Fast STT (Speech-to-Phrase)
+        self._fast_stt_config = FastSTTConfig(
+            host=config.fast_stt_host,
+            port=config.fast_stt_port,
+            enabled=config.fast_stt_enabled,
+        )
 
         # Wake verifier (speaker-specific filter)
         self._wake_verifier = WakeVerifier(
@@ -582,9 +595,21 @@ class Orchestrator:
     # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
-        """Run STT with name corrections and hallucination filtering."""
+        """Run STT with fast path for device commands, then full STT fallback."""
         log.info("=== STT ===")
         self._stt_start = time.monotonic()
+
+        # Try Speech-to-Phrase first (constrained, fast, no garbling)
+        fast_result = await transcribe_fast(chunks, self._fast_stt_config)
+        if fast_result:
+            self._stt_ms = (time.monotonic() - self._stt_start) * 1000
+            log.info("Fast STT matched: \"%s\" (%.0fms)", fast_result, self._stt_ms)
+            # Start speaker verification in background
+            speaker_audio = np.concatenate([c.samples for c in chunks[:150]])
+            asyncio.create_task(self._identify_speaker(speaker_audio))
+            return fast_result
+
+        # Fall back to full STT
         transcript = await transcribe(chunks, self._stt_config)
         self._stt_ms = (time.monotonic() - self._stt_start) * 1000
 

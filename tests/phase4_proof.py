@@ -102,6 +102,11 @@ async def main() -> None:
         # Sounds
         sounds_dir="/home/chaos/pi-fi-software/voice/sounds",
 
+        # Speech-to-Phrase fast path (HA add-on)
+        fast_stt_host="10.1.1.53",
+        fast_stt_port=10302,
+        fast_stt_enabled=True,
+
         # Wake verifier — disabled until embedding mismatch is resolved
         # (training recordings don't match live capture path)
         wake_verifier_path="",
