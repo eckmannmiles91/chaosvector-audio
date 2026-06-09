@@ -1,0 +1,16 @@
+[Unit]
+Description=LiveKit WakeWord — Wake Word Detection (Wyoming)
+Before=chaosvector-audio.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chaos/chaosvector-audio
+Environment=PYTHONPATH=/home/chaos/chaosvector-audio/src
+ExecStart=/home/chaos/pi-fi-software/voice/.venv/bin/python -m chaosvector_audio.wake_livekit --model /home/chaos/chaosvector-audio/model/hey_jarvis_livekit.onnx --port 10401 --threshold 0.12
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/home/chaos/logs/livekit-wakeword.log
+StandardError=append:/home/chaos/logs/livekit-wakeword.log
+
+[Install]
+WantedBy=default.target

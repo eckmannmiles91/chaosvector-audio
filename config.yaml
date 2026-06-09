@@ -12,10 +12,10 @@ audio:
 
 wake_word:
   host: "127.0.0.1"
-  port: 10400
-  names: ["hey_jarvis"]
+  port: 10401               # LiveKit WakeWord (was 10400 for openWakeWord)
+  names: ["hey_jarvis_livekit"]
   energy_threshold: 320
-  gain: 4.0                 # boost audio to openWakeWord (matches satellite.py)
+  gain: 4.0
 
 vad:
   aggressiveness: 2
