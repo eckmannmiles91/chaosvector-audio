@@ -96,6 +96,9 @@ class LiveKitWakeHandler(AsyncEventHandler):
             self._audio_buffer.extend(chunk.audio)
 
             # Process when we have enough audio (~2s window)
+            buf_chunks = len(self._audio_buffer) // (320 * 2)
+            if buf_chunks % 50 == 1:
+                log.debug("buffer: %d chunks (%d bytes)", buf_chunks, len(self._audio_buffer))
             if len(self._audio_buffer) >= WINDOW_SAMPLES * 2:  # 2 bytes per sample
                 # Cooldown check
                 if time.monotonic() < self._cooldown_until:
@@ -118,9 +121,12 @@ class LiveKitWakeHandler(AsyncEventHandler):
                         log.info("wake detected: %s (score=%.3f)", name, score)
                         self._detecting = False
                         self._cooldown_until = time.monotonic() + 2.0
-                        await self.write_event(
-                            Detection(name=name, timestamp=int(time.time() * 1000)).event()
-                        )
+                        try:
+                            await self.write_event(
+                                Detection(name=name, timestamp=int(time.time() * 1000)).event()
+                            )
+                        except (ConnectionResetError, BrokenPipeError, OSError):
+                            log.debug("client disconnected before detection sent")
                         return True
 
                 # Keep only the last window
