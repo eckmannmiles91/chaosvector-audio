@@ -12,8 +12,8 @@ audio:
 
 wake_word:
   host: "127.0.0.1"
-  port: 10401               # LiveKit WakeWord (was 10400 for openWakeWord)
-  names: ["hey_jarvis_livekit"]
+  port: 10400               # openWakeWord (LiveKit on 10401 — not detecting real voice yet)
+  names: ["hey_jarvis"]
   energy_threshold: 320
   gain: 4.0
 
