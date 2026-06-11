@@ -12,7 +12,7 @@ audio:
 
 wake_word:
   host: "127.0.0.1"
-  port: 10400               # openWakeWord (LiveKit needs wrapper redesign)
+  port: 10400               # openWakeWord (LiveKit too many false wakes on TV)
   names: ["hey_jarvis"]
   energy_threshold: 320
   gain: 4.0

@@ -1,12 +1,7 @@
 """LiveKit WakeWord Wyoming TCP server — drop-in replacement for openWakeWord.
 
-Runs the LiveKit WakeWord ONNX model and exposes it via the Wyoming protocol
-so existing Wyoming clients (including our wake.py) can connect unchanged.
-
-Usage:
-    python -m chaosvector_audio.wake_livekit --model /path/to/hey_jarvis.onnx --port 10400
-
-Or as a systemd service replacing wyoming-openwakeword.
+Mirrors openWakeWord's handler pattern: processes each audio chunk inline
+and sends Detection events immediately when the wake word is detected.
 """
 
 from __future__ import annotations
@@ -15,12 +10,13 @@ import argparse
 import asyncio
 import logging
 import time
+from collections import deque
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 
-from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, WakeModel, WakeProgram
 from wyoming.server import AsyncEventHandler, AsyncServer
@@ -28,52 +24,40 @@ from wyoming.wake import Detect, Detection, NotDetected
 
 log = logging.getLogger(__name__)
 
-# LiveKit model expects 16kHz mono, processes ~2s windows
 SAMPLE_RATE = 16000
-CHANNELS = 1
-WINDOW_SAMPLES = SAMPLE_RATE * 2  # 2 second sliding window
 
 
 class LiveKitWakeHandler(AsyncEventHandler):
-    """Wyoming event handler for LiveKit WakeWord detection."""
+    """Wyoming event handler — processes audio inline like openWakeWord."""
 
-    def __init__(
-        self,
-        model,
-        threshold: float,
-        *args, **kwargs,
-    ) -> None:
+    def __init__(self, model, threshold: float, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._model = model
         self._threshold = threshold
-        self._audio_buffer = bytearray()
+        self._converter = AudioChunkConverter(rate=SAMPLE_RATE, width=2, channels=1)
         self._detecting = False
+        self._detected = False
         self._names: list[str] = []
         self._cooldown_until: float = 0.0
+        self._audio_timestamp: int = 0
+        # Rolling buffer for last 2s of audio (100 chunks at 20ms)
+        self._chunk_buffer: deque[np.ndarray] = deque(maxlen=100)
+        self._chunks_since_predict: int = 0
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
+            model_names = list(self._model.models.keys()) if hasattr(self._model, 'models') else ["hey_jarvis"]
             info = Info(
-                wake=[
-                    WakeProgram(
-                        name="livekit-wakeword",
-                        description="LiveKit WakeWord Detection",
-                        attribution=Attribution(
-                            name="LiveKit", url="https://github.com/livekit/livekit-wakeword",
-                        ),
-                        installed=True,
-                        models=[
-                            WakeModel(
-                                name=name,
-                                description=f"Wake word: {name}",
-                                attribution=Attribution(name="custom", url=""),
-                                installed=True,
-                                languages=["en"],
-                            )
-                            for name in (list(self._model.models.keys()) if hasattr(self._model, 'models') else ["hey_jarvis"])
-                        ],
-                    )
-                ],
+                wake=[WakeProgram(
+                    name="livekit-wakeword",
+                    description="LiveKit WakeWord Detection",
+                    attribution=Attribution(name="LiveKit", url="https://github.com/livekit/livekit-wakeword"),
+                    installed=True,
+                    models=[WakeModel(name=n, description=f"Wake word: {n}",
+                                      attribution=Attribution(name="custom", url=""),
+                                      installed=True, languages=["en"])
+                            for n in model_names],
+                )],
             )
             await self.write_event(info.event())
             return True
@@ -81,62 +65,67 @@ class LiveKitWakeHandler(AsyncEventHandler):
         if Detect.is_type(event.type):
             detect = Detect.from_event(event)
             self._detecting = True
+            self._detected = False
             self._names = detect.names or []
-            self._audio_buffer.clear()
+            self._chunk_buffer.clear()
+            self._chunks_since_predict = 0
             return True
 
         if AudioStart.is_type(event.type):
+            self._audio_timestamp = 0
+            self._chunk_buffer.clear()
+            self._chunks_since_predict = 0
             return True
 
         if AudioChunk.is_type(event.type):
             if not self._detecting:
                 return True
 
-            chunk = AudioChunk.from_event(event)
-            self._audio_buffer.extend(chunk.audio)
+            chunk = self._converter.convert(AudioChunk.from_event(event))
+            audio = np.frombuffer(chunk.audio, dtype=np.int16)
+            self._chunk_buffer.append(audio)
+            self._audio_timestamp += chunk.milliseconds
+            self._chunks_since_predict += 1
 
-            # Process when we have enough audio (~2s window)
-            buf_chunks = len(self._audio_buffer) // (320 * 2)
-            if buf_chunks % 50 == 1:
-                log.debug("buffer: %d chunks (%d bytes)", buf_chunks, len(self._audio_buffer))
-            if len(self._audio_buffer) >= WINDOW_SAMPLES * 2:  # 2 bytes per sample
+            # Run prediction every 10 chunks (~200ms) once we have 2s buffered
+            if self._chunks_since_predict >= 10 and len(self._chunk_buffer) >= 50:
+                self._chunks_since_predict = 0
+
                 # Cooldown check
                 if time.monotonic() < self._cooldown_until:
-                    # Trim buffer but don't process
-                    self._audio_buffer = self._audio_buffer[-(WINDOW_SAMPLES * 2):]
                     return True
 
-                # Convert to numpy
-                audio = np.frombuffer(bytes(self._audio_buffer[-(WINDOW_SAMPLES * 2):]),
-                                      dtype=np.int16)
+                # Concatenate buffer into window
+                window = np.concatenate(list(self._chunk_buffer))
 
                 # Run prediction
-                scores = self._model.predict(audio)
+                scores = self._model.predict(window)
 
-                # Check each model
                 for name, score in scores.items():
                     if score >= self._threshold:
                         if self._names and name not in self._names:
                             continue
                         log.info("wake detected: %s (score=%.3f)", name, score)
                         self._detecting = False
+                        self._detected = True
                         self._cooldown_until = time.monotonic() + 2.0
                         try:
                             await self.write_event(
-                                Detection(name=name, timestamp=int(time.time() * 1000)).event()
+                                Detection(name=name, timestamp=self._audio_timestamp).event()
                             )
                         except (ConnectionResetError, BrokenPipeError, OSError):
                             log.debug("client disconnected before detection sent")
                         return True
 
-                # Keep only the last window
-                self._audio_buffer = self._audio_buffer[-(WINDOW_SAMPLES * 2):]
             return True
 
         if AudioStop.is_type(event.type):
-            if self._detecting:
-                self._detecting = False
-                await self.write_event(NotDetected().event())
+            if self._detecting and not self._detected:
+                try:
+                    await self.write_event(NotDetected().event())
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    pass
+            self._detecting = False
             return True
 
         return True
@@ -145,8 +134,8 @@ class LiveKitWakeHandler(AsyncEventHandler):
 async def main() -> None:
     parser = argparse.ArgumentParser(description="LiveKit WakeWord Wyoming Server")
     parser.add_argument("--model", required=True, help="Path to ONNX model file")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Detection threshold")
-    parser.add_argument("--port", type=int, default=10400, help="Wyoming TCP port")
+    parser.add_argument("--threshold", type=float, default=0.10, help="Detection threshold")
+    parser.add_argument("--port", type=int, default=10401, help="Wyoming TCP port")
     parser.add_argument("--host", default="127.0.0.1", help="Listen address")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -160,7 +149,7 @@ async def main() -> None:
     log.info("Loading model: %s", args.model)
     model = WakeWordModel(models=[args.model])
     model_names = list(model.models.keys()) if hasattr(model, 'models') else [Path(args.model).stem]
-    log.info("Model loaded: %s", model_names)
+    log.info("Model loaded: %s (threshold=%.2f)", model_names, args.threshold)
 
     server = AsyncServer.from_uri(f"tcp://{args.host}:{args.port}")
     log.info("Listening on %s:%d", args.host, args.port)
