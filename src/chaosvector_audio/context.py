@@ -23,7 +23,7 @@ class ContextConfig:
     url: str = "http://10.1.1.176:8400"
     cache_path: str = "/tmp/pifi_context_cache.json"
     answer_timeout: float = 2.0
-    cache_refresh_interval: float = 300.0  # 5 minutes
+    cache_refresh_interval: float = 60.0  # 1 minute — presence/location needs to be fresh
 
 
 class ContextClient:

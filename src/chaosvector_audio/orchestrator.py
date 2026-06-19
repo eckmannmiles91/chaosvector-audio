@@ -26,6 +26,7 @@ from chaosvector_audio.playback import PlaybackConfig, PlaybackManager, Playback
 from chaosvector_audio.vad import VADConfig, VoiceActivityDetector
 from chaosvector_audio.wake import WakeConfig, WakeWordClient
 from chaosvector_audio.stt import STTConfig, transcribe
+from chaosvector_audio.stt_streaming import StreamingSTTConfig, StreamingSTTSession
 from chaosvector_audio.tts import TTSConfig, synthesize
 from chaosvector_audio.llm import LLMConfig, LLMClient
 from chaosvector_audio.context import ContextConfig, ContextClient, get_local_time
@@ -345,11 +346,51 @@ class Orchestrator:
         # Pre-warm TTS cache (runs in background)
         asyncio.create_task(prewarm_cache(self._tts_cache, synthesize, self._tts_config))
 
+        # Recurring precache: pull predicted answers from context engine and pre-synthesize TTS
+        asyncio.create_task(self._precache_loop())
+
         # Health reporting to HA
         await self._health.start(self._get_health_status)
 
         self._running = True
         log.info("orchestrator started")
+
+    async def _precache_loop(self) -> None:
+        """Periodically fetch predicted answers from context engine and pre-synthesize TTS."""
+        import aiohttp
+        await asyncio.sleep(10)  # initial delay — let services settle
+        while self._running:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{self._context.config.url}/precache",
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            entries = await resp.json()
+                            synthesized = 0
+                            for entry in entries:
+                                text = entry.get("answer", "")
+                                if not text:
+                                    continue
+                                if not self._tts_cache.get(text):
+                                    try:
+                                        from chaosvector_audio.tts import synthesize
+                                        result = await synthesize(text, self._tts_config)
+                                        if result and result.audio is not None:
+                                            self._tts_cache.put(
+                                                text, result.audio, result.sample_rate,
+                                                result.audio_bytes,
+                                            )
+                                            synthesized += 1
+                                    except Exception as e:
+                                        log.debug("precache synth failed: %s", e)
+                            if synthesized:
+                                log.info("precache: %d new entries synthesized (total %d)",
+                                         synthesized, self._tts_cache.size)
+            except Exception as e:
+                log.debug("precache loop error: %s", e)
+            await asyncio.sleep(60)  # refresh every 60 seconds
 
     async def stop(self) -> None:
         self._running = False
@@ -499,8 +540,25 @@ class Orchestrator:
     # -- LISTENING -----------------------------------------------------------
 
     async def _listen(self) -> list[AudioChunk] | None:
-        """Collect utterance via VAD."""
+        """Collect utterance via VAD while streaming to STT in real-time.
+
+        Opens the STT connection at the start and sends audio chunks as they
+        arrive. When VAD detects end-of-speech, the transcript is ready almost
+        instantly since the server already has all the audio.
+        """
         log.info("=== LISTENING ===")
+
+        # Start streaming STT session
+        self._streaming_stt = StreamingSTTSession(StreamingSTTConfig(
+            host=self._stt_config.host,
+            port=self._stt_config.port,
+            language=self._stt_config.language,
+            timeout=self._stt_config.timeout,
+        ))
+        stt_connected = await self._streaming_stt.start()
+        if not stt_connected:
+            log.warning("Streaming STT failed to connect, will fall back to buffered")
+
         # Include late pre-roll (speech that started during wake word)
         # but skip the first 500ms (the wake word itself)
         pre_roll = self._capture.drain_pre_roll()
@@ -510,6 +568,11 @@ class Orchestrator:
             late_chunks = pre_roll[skip_chunks:]
             if late_chunks:
                 utterance.extend(late_chunks)
+                # Send pre-roll to streaming STT
+                if stt_connected:
+                    for c in late_chunks:
+                        await self._streaming_stt.send_chunk(c)
+
         listen_start = time.monotonic()
 
         blanking_chunks = int(self.config.chime_blanking_ms / self.config.chunk_ms)
@@ -522,6 +585,9 @@ class Orchestrator:
                 blanked += 1
                 continue
             utterance.append(chunk)
+            # Stream chunk to STT in real-time
+            if stt_connected:
+                await self._streaming_stt.send_chunk(chunk)
             _, end_of_speech = self._vad.process_frame(chunk.samples)
             elapsed = time.monotonic() - listen_start
             if end_of_speech and elapsed > min_listen_s:
@@ -603,13 +669,19 @@ class Orchestrator:
     # -- STT -----------------------------------------------------------------
 
     async def _process_stt(self, chunks: list[AudioChunk]) -> str | None:
-        """Run S2P and full STT in parallel — use whichever wins."""
+        """Get transcript from streaming STT (already has audio) + S2P in parallel."""
         log.info("=== STT ===")
         self._stt_start = time.monotonic()
 
-        # Run both in parallel
-        fast_task = asyncio.create_task(transcribe_fast(chunks, self._fast_stt_config))
-        full_task = asyncio.create_task(transcribe(chunks, self._stt_config))
+        # Streaming STT: just call finish() — server already has all audio
+        if hasattr(self, "_streaming_stt") and self._streaming_stt and self._streaming_stt._connected:
+            fast_task = asyncio.create_task(transcribe_fast(chunks, self._fast_stt_config))
+            full_task = asyncio.create_task(self._streaming_stt.finish())
+        else:
+            # Fallback: buffered send (streaming connection failed)
+            log.info("Falling back to buffered STT")
+            fast_task = asyncio.create_task(transcribe_fast(chunks, self._fast_stt_config))
+            full_task = asyncio.create_task(transcribe(chunks, self._stt_config))
 
         # Wait for both to complete (both are fast, <1s typically)
         fast_result, full_result = await asyncio.gather(fast_task, full_task)
