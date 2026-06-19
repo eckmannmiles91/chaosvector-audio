@@ -10,13 +10,13 @@ import re
 
 # Family data — keep in sync with the Phase 1B system prompt
 FAMILY = {
-    "miles": {"role": "Dad", "age": 34, "interests": "tech, cars, and alternative rock", "birthday": "September 9"},
-    "jennie": {"role": "Mom", "age": 37, "interests": "reading and movies", "birthday": "March 12"},
-    "sam": {"role": "child", "age": 16, "interests": "video games", "birthday": "July 24", "order": "oldest"},
-    "zoey": {"role": "child", "age": 14, "interests": "crochet, bass, and cooking", "birthday": "October 31"},
-    "kinzleigh": {"role": "child", "age": 13, "interests": "games and fashion", "birthday": "November 12", "nicknames": ["kinz"]},
-    "lexi": {"role": "child", "age": 13, "interests": "singing and music", "birthday": "January 22"},
-    "eli": {"role": "child", "age": 10, "interests": "soccer, games, and basketball", "birthday": "September 21", "order": "youngest", "full_name": "Elias"},
+    "miles": {"role": "Dad", "age": 34, "gender": "male", "interests": "tech, cars, and alternative rock", "birthday": "September 9"},
+    "jennie": {"role": "Mom", "age": 37, "gender": "female", "interests": "reading and movies", "birthday": "March 12"},
+    "sam": {"role": "child", "age": 16, "gender": "male", "interests": "video games", "birthday": "July 24", "order": "oldest"},
+    "zoey": {"role": "child", "age": 14, "gender": "female", "interests": "crochet, bass, and cooking", "birthday": "October 31"},
+    "kinzleigh": {"role": "child", "age": 13, "gender": "female", "interests": "games and fashion", "birthday": "November 12", "nicknames": ["kinz"]},
+    "lexi": {"role": "child", "age": 13, "gender": "female", "interests": "singing and music", "birthday": "January 22"},
+    "eli": {"role": "child", "age": 10, "gender": "male", "interests": "soccer, games, and basketball", "birthday": "September 21", "order": "youngest", "full_name": "Elias"},
 }
 
 CHILDREN = ["Sam", "Zoey", "Kinzleigh", "Lexi", "Eli"]
@@ -62,10 +62,28 @@ def answer_family_question(text: str) -> str | None:
     """
     text_lower = text.lower()
 
-    # "Who is the oldest/youngest kid?"
+    # "Who is the oldest/youngest kid?" — with gender awareness
+    _GIRL_RE = re.compile(r"\b(?:girl|daughter|sister)\b", re.I)
+    _BOY_RE = re.compile(r"\b(?:boy|son|brother)\b", re.I)
     if _OLDEST_RE.search(text_lower):
+        if _GIRL_RE.search(text_lower):
+            girls = [(k, v) for k, v in FAMILY.items() if v["role"] == "child" and v["gender"] == "female"]
+            oldest_girl = max(girls, key=lambda x: x[1]["age"])
+            return f"{oldest_girl[0].title()} is the oldest girl at {oldest_girl[1]['age']}."
+        if _BOY_RE.search(text_lower):
+            boys = [(k, v) for k, v in FAMILY.items() if v["role"] == "child" and v["gender"] == "male"]
+            oldest_boy = max(boys, key=lambda x: x[1]["age"])
+            return f"{oldest_boy[0].title()} is the oldest boy at {oldest_boy[1]['age']}."
         return "Sam is the oldest at 16."
     if _YOUNGEST_RE.search(text_lower):
+        if _GIRL_RE.search(text_lower):
+            girls = [(k, v) for k, v in FAMILY.items() if v["role"] == "child" and v["gender"] == "female"]
+            youngest_girl = min(girls, key=lambda x: x[1]["age"])
+            return f"{youngest_girl[0].title()} is the youngest girl at {youngest_girl[1]['age']}."
+        if _BOY_RE.search(text_lower):
+            boys = [(k, v) for k, v in FAMILY.items() if v["role"] == "child" and v["gender"] == "male"]
+            youngest_boy = min(boys, key=lambda x: x[1]["age"])
+            return f"{youngest_boy[0].title()} is the youngest boy at {youngest_boy[1]['age']}."
         return "Eli is the youngest at 10."
 
     # "How many kids?"
