@@ -27,6 +27,7 @@ from chaosvector_audio.vad import VADConfig, VoiceActivityDetector
 from chaosvector_audio.wake import WakeConfig, WakeWordClient
 from chaosvector_audio.stt import STTConfig, transcribe
 from chaosvector_audio.stt_streaming import StreamingSTTConfig, StreamingSTTSession
+from chaosvector_audio.family_knowledge import answer_family_question
 from chaosvector_audio.tts import TTSConfig, synthesize
 from chaosvector_audio.llm import LLMConfig, LLMClient
 from chaosvector_audio.context import ContextConfig, ContextClient, get_local_time
@@ -346,6 +347,9 @@ class Orchestrator:
         # Pre-warm TTS cache (runs in background)
         asyncio.create_task(prewarm_cache(self._tts_cache, synthesize, self._tts_config))
 
+        # Pre-synthesize common family knowledge answers (static, never change)
+        asyncio.create_task(self._prewarm_static_answers())
+
         # Recurring precache: pull predicted answers from context engine and pre-synthesize TTS
         asyncio.create_task(self._precache_loop())
 
@@ -354,6 +358,31 @@ class Orchestrator:
 
         self._running = True
         log.info("orchestrator started")
+
+    async def _prewarm_static_answers(self) -> None:
+        """Pre-synthesize static answers that never change (family knowledge, etc)."""
+        from chaosvector_audio.tts import synthesize
+        static_answers = [
+            "Sam is the oldest at 16.",
+            "Eli is the youngest at 10.",
+            "There are five kids: Sam, Zoey, Kinzleigh, Lexi, and Eli.",
+            "The kids are Sam, Zoey, Kinzleigh, Lexi, and Eli.",
+            "The family dog is Honey.",
+            "Miles is the dad. He's 34 and into tech, cars, and alternative rock.",
+            "Jennie is the mom. She's 37 and into reading and movies.",
+        ]
+        count = 0
+        for text in static_answers:
+            if not self._tts_cache.get(text):
+                try:
+                    result = await synthesize(text, self._tts_config)
+                    if result and result.audio is not None:
+                        self._tts_cache.put(text, result.audio, result.sample_rate, result.audio_bytes)
+                        count += 1
+                except Exception as e:
+                    log.debug("static precache failed: %s", e)
+        if count:
+            log.info("static precache: %d family answers synthesized", count)
 
     async def _precache_loop(self) -> None:
         """Periodically fetch predicted answers from context engine and pre-synthesize TTS."""
@@ -784,9 +813,17 @@ class Orchestrator:
                 route = "ha"
                 self._track_entities(transcript)
             elif intent_type == "general":
-                await self._handle_general(transcript)
-                follow_up = True
-                route = "llm"
+                # Try family knowledge first — instant answers for static facts
+                family_answer = answer_family_question(transcript)
+                if family_answer:
+                    log.info("Family knowledge: %s", family_answer)
+                    await self._speak(family_answer)
+                    response_text = family_answer
+                    route = "family_knowledge"
+                else:
+                    await self._handle_general(transcript)
+                    follow_up = True
+                    route = "llm"
             elif intent_type == "complex":
                 await self._respond_llm(transcript)
                 follow_up = True
