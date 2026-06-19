@@ -28,6 +28,7 @@ from chaosvector_audio.wake import WakeConfig, WakeWordClient
 from chaosvector_audio.stt import STTConfig, transcribe
 from chaosvector_audio.stt_streaming import StreamingSTTConfig, StreamingSTTSession
 from chaosvector_audio.family_knowledge import answer_family_question
+from chaosvector_audio.wake_shadow import ShadowWakeDetector, ShadowWakeConfig
 from chaosvector_audio.tts import TTSConfig, synthesize
 from chaosvector_audio.llm import LLMConfig, LLMClient
 from chaosvector_audio.context import ContextConfig, ContextClient, get_local_time
@@ -355,6 +356,17 @@ class Orchestrator:
 
         # Health reporting to HA
         await self._health.start(self._get_health_status)
+
+        # Start shadow wake detector (runs our ONNX model in parallel for comparison)
+        self._shadow_wake = ShadowWakeDetector(ShadowWakeConfig(
+            model_path="/home/chaos/chaosvector-audio/model/chaosvector-wake.onnx",
+            threshold=0.7,
+            trigger_level=2,
+            energy_threshold=self.config.wake_energy_threshold,
+        ))
+        shadow_queue = asyncio.Queue(maxsize=200)
+        self._shadow_audio_queue = shadow_queue
+        asyncio.create_task(self._shadow_wake.start(shadow_queue))
 
         self._running = True
         log.info("orchestrator started")
@@ -1490,6 +1502,12 @@ class Orchestrator:
                 self._wake_audio_queue.put_nowait(raw)
             except asyncio.QueueFull:
                 pass
+            # Feed shadow detector
+            if hasattr(self, '_shadow_audio_queue'):
+                try:
+                    self._shadow_audio_queue.put_nowait(raw)
+                except asyncio.QueueFull:
+                    pass
 
     def _load_pifi_modules(self) -> None:
         """Import intent classifier and managers from pi-fi-software."""
