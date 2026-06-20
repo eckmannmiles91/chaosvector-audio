@@ -42,8 +42,22 @@ class ShadowWakeDetector:
         self._session = None
         self._running = False
         self._consecutive = 0
+        self._muted = False  # Set True during TTS playback to prevent self-hearing
+        self._mute_until: float = 0.0  # monotonic timestamp — muted until this time
         # Rolling audio buffer — last 2 seconds of audio
         self._audio_buf = collections.deque(maxlen=int(SAMPLE_RATE * CLIP_DURATION))
+
+    def mute(self, duration: float = 2.0) -> None:
+        """Mute detection for duration seconds (call before TTS playback)."""
+        import time
+        self._mute_until = time.monotonic() + duration
+        self._consecutive = 0
+        self._audio_buf.clear()
+
+    @property
+    def is_muted(self) -> bool:
+        import time
+        return time.monotonic() < self._mute_until
 
     def load(self) -> bool:
         try:
@@ -86,6 +100,11 @@ class ShadowWakeDetector:
 
             # Run inference every 500ms (25 chunks at 20ms)
             if chunk_count % 25 != 0:
+                continue
+
+            # Echo gate — skip during/after TTS playback
+            if self.is_muted:
+                self._consecutive = 0
                 continue
 
             # RMS energy check

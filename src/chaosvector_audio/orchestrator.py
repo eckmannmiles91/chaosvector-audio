@@ -522,6 +522,9 @@ class Orchestrator:
         # Play wake sound at low volume (15%, matches satellite.py)
         # Don't wait — play in background while listening starts
         quiet_beep = (self._beep.astype(np.float64) * 0.15).astype(np.int16)
+        # Mute shadow during beep + room reverb
+        if hasattr(self, '_shadow_wake'):
+            self._shadow_wake.mute(1.5)
         await self._playback.enqueue(
             quiet_beep, sample_rate=self._beep_rate,
             priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
@@ -1134,6 +1137,10 @@ class Orchestrator:
                 self._tts_cache.put(text, result.audio, result.sample_rate,
                                     result.channels, result.duration_ms)
         if result is not None:
+            # Mute shadow wake detector during playback + 2s echo tail
+            if hasattr(self, '_shadow_wake'):
+                duration = (result.duration_ms / 1000.0) + 2.0
+                self._shadow_wake.mute(duration)
             # Start barge-in listener during playback
             self._wake.has_pending_wake()  # clear stale
             barge_feed = asyncio.create_task(self._feed_wake_audio())
