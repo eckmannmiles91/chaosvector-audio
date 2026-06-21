@@ -898,6 +898,25 @@ class Orchestrator:
         if context_query and self._context.is_available:
             answer = await self._context.get_answer(context_query)
             if answer:
+                # If user asked about tomorrow, strip the "today" portion
+                if context_query == "forecast" and "tomorrow" in transcript.lower():
+                    import re as _re
+                    tomorrow_match = _re.search(r'(Tomorrow\b.+)', answer, _re.IGNORECASE)
+                    if tomorrow_match:
+                        answer = tomorrow_match.group(1)
+
+                # If user asked about a specific person, extract just their info
+                if context_query == "presence":
+                    import re as _re
+                    name_match = _re.search(r"where(?:'?s|\s+is)\s+(\w+)", transcript, _re.IGNORECASE)
+                    if name_match:
+                        person = name_match.group(1)
+                        # Find the sentence about this person in the answer
+                        for sentence in answer.split(". "):
+                            if person.lower() in sentence.lower():
+                                answer = sentence.strip().rstrip(".") + "."
+                                break
+
                 log.info("Context answer (%s): %s", context_query, answer[:80])
                 await self._speak(answer)
                 return answer
