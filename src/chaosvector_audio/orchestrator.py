@@ -894,6 +894,15 @@ class Orchestrator:
             await self._speak(response)
             return response
 
+        # Humidity — pull directly from HA weather entity
+        if "humid" in transcript.lower():
+            humidity = await self._get_humidity()
+            if humidity is not None:
+                response = f"The humidity is {humidity} percent."
+                log.info("Humidity: %s", response)
+                await self._speak(response)
+                return response
+
         # Everything else: ask context engine
         if context_query and self._context.is_available:
             answer = await self._context.get_answer(context_query)
@@ -1207,6 +1216,24 @@ class Orchestrator:
             await asyncio.sleep(0.1)
             waited += 0.1
         return False
+
+    # -- Weather helpers -----------------------------------------------------
+
+    async def _get_humidity(self) -> int | None:
+        """Get current outdoor humidity from HA weather entity."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.config.ha_http_url}/api/states/weather.forecast_home",
+                    headers={"Authorization": f"Bearer {self.config.ha_token}"},
+                    timeout=aiohttp.ClientTimeout(total=3.0),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("attributes", {}).get("humidity")
+        except Exception as e:
+            log.debug("humidity lookup failed: %s", e)
+        return None
 
     # -- Location resolution -------------------------------------------------
 
