@@ -906,16 +906,25 @@ class Orchestrator:
                         answer = tomorrow_match.group(1)
 
                 # If user asked about a specific person, extract just their info
+                # and resolve "away" to a city name via GPS reverse geocoding
                 if context_query == "presence":
                     import re as _re
                     name_match = _re.search(r"where(?:'?s|\s+is)\s+(\w+)", transcript, _re.IGNORECASE)
                     if name_match:
                         person = name_match.group(1)
-                        # Find the sentence about this person in the answer
+                        # Find the sentence about this person
+                        person_answer = None
                         for sentence in answer.split(". "):
                             if person.lower() in sentence.lower():
-                                answer = sentence.strip().rstrip(".") + "."
+                                person_answer = sentence.strip().rstrip(".") + "."
                                 break
+                        if person_answer:
+                            answer = person_answer
+                        # If "away", try to get city from GPS
+                        if "away" in answer.lower():
+                            city = await self._get_person_city(person)
+                            if city:
+                                answer = answer.replace("is away", f"is in {city}").replace("is Away", f"is in {city}")
 
                 log.info("Context answer (%s): %s", context_query, answer[:80])
                 await self._speak(answer)
@@ -1198,6 +1207,49 @@ class Orchestrator:
             await asyncio.sleep(0.1)
             waited += 0.1
         return False
+
+    # -- Location resolution -------------------------------------------------
+
+    async def _get_person_city(self, name: str) -> str | None:
+        """Get city name for a person who is 'away' via HA GPS + reverse geocoding."""
+        try:
+            # Look up person entity in HA
+            person_id = f"person.{name.lower()}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.config.ha_http_url}/api/states/{person_id}",
+                    headers={"Authorization": f"Bearer {self.config.ha_token}"},
+                    timeout=aiohttp.ClientTimeout(total=5.0),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+
+            attrs = data.get("attributes", {})
+            lat = attrs.get("latitude")
+            lon = attrs.get("longitude")
+            if lat is None or lon is None:
+                return None
+
+            # Reverse geocode via OpenStreetMap Nominatim (free, no API key)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://nominatim.openstreetmap.org/reverse",
+                    params={"lat": lat, "lon": lon, "format": "json", "zoom": 10},
+                    headers={"User-Agent": "ChaosVector-Audio/1.0"},
+                    timeout=aiohttp.ClientTimeout(total=3.0),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    geo = await resp.json()
+
+            address = geo.get("address", {})
+            city = address.get("city") or address.get("town") or address.get("suburb") or address.get("village")
+            return city
+
+        except Exception as e:
+            log.debug("person city lookup failed: %s", e)
+            return None
 
     # -- Wake audio collection -----------------------------------------------
 
