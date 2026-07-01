@@ -1607,11 +1607,40 @@ class Orchestrator:
     async def _feed_wake_audio(self) -> None:
         """Feed capture chunks to wake word queue.
         Suppresses during echo tail (post-playback) but NOT during playback
-        itself — barge-in needs to hear the wake word during TTS."""
+        itself — barge-in needs to hear the wake word during TTS.
+        VAD gate: only send audio that contains speech-like content.
+        Rejects sniffles, clicks, and transient noise."""
+        from chaosvector_audio.vad import VADConfig, VoiceActivityDetector, SpeechState
+        wake_vad = VoiceActivityDetector(VADConfig(
+            aggressiveness=3,       # max filtering
+            sample_rate=self.config.sample_rate,
+            frame_duration_ms=self.config.chunk_ms,
+            silence_frames_threshold=5,   # quick reset
+            min_speech_frames=3,    # need 3 consecutive speech frames (~60ms) to pass
+        ))
+        speech_frame_count = 0
+
         async for chunk in self._capture.chunks():
             # Only suppress during echo tail AFTER playback ends (not during)
             if not self._responding and self._is_echo_active():
+                speech_frame_count = 0
                 continue
+
+            # VAD gate: only forward audio that looks like speech
+            is_speech = wake_vad.is_speech(chunk.samples)
+            if is_speech:
+                speech_frame_count += 1
+            else:
+                # Allow a few silent frames through once speech started
+                # (natural pauses in "hey... Jarvis")
+                if speech_frame_count > 0:
+                    speech_frame_count = max(0, speech_frame_count - 1)
+
+            # Only send to wake detector if we've seen sustained speech
+            # (3+ consecutive frames = ~60ms, filters sniffles/clicks)
+            if speech_frame_count < 3:
+                continue
+
             raw = chunk.samples.astype(np.int16).tobytes()
             try:
                 self._wake_audio_queue.put_nowait(raw)
