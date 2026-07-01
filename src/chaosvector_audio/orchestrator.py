@@ -986,6 +986,16 @@ class Orchestrator:
             await self._respond_llm(transcript)
             return ""
 
+        # Rewrite "dim X to Y%" → "set X brightness to Y percent"
+        # HA Assist doesn't understand "dim" but understands "set brightness"
+        dim_match = re.match(
+            r"dim\s+(?:the\s+)?(.+?)\s+to\s+(\d+)\s*%?\.?$", transcript, re.I
+        )
+        if dim_match:
+            device, level = dim_match.group(1), dim_match.group(2)
+            transcript = f"set {device} brightness to {level} percent"
+            log.info("Rewritten dim command: \"%s\"", transcript)
+
         log.info("Sending to HA: \"%s\"", transcript)
         response = await self._ha.run_intent(transcript)
 
