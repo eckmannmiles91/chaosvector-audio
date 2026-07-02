@@ -2,51 +2,88 @@
 
 ## What this is
 
-Unified audio pipeline daemon for the Pi-Fi speaker. Single Python process that owns the entire audio path: capture, playback, echo cancellation, and voice routing. Replaces the Wyoming TCP protocol stack and PipeWire filter-chain glue.
+Production voice pipeline daemon for the Pi-Fi smart speaker. Replaces satellite.py (2300 lines) with a modular, single-process architecture. In production since May 2026.
 
-## Deployment target
+## Deployment
 
-- Raspberry Pi 5 (4 GB+)
-- USB mic array (ReSpeaker or similar), or XMOS XVF3800 dev kit for hardware AEC
-- PipeWire for audio backend (via sounddevice/portaudio)
-- Python 3.11+
+- **Pi 5** (10.1.1.235) — `/home/chaos/chaosvector-audio/`
+- **Config:** `config.yaml` (YAML with `${ENV_VAR}` resolution)
+- **Entry point:** `python -m chaosvector_audio --config config.yaml`
+- **Systemd:** `chaosvector-audio.service` (user), `wyoming-openwakeword.service` (user)
+- **Logs:** `/home/chaos/logs/chaosvector-audio.log` (daily rotation, 7 days)
+- **Env:** Uses pi-fi-software venv at `/home/chaos/pi-fi-software/voice/.venv/`
+- **Env vars:** `EnvironmentFile=/home/chaos/pi-fi-software/.env` (HA_TOKEN, etc.)
 
 ## Architecture
 
-The pipeline is a state machine: IDLE -> LISTENING -> PROCESSING -> RESPONDING -> IDLE.
-
-Key modules:
-- `capture.py` — async audio capture with ring buffer pre-roll
-- `playback.py` — priority-queued playback with barge-in support
-- `aec.py` — echo cancellation (hardware passthrough or software via WebRTC AEC3)
-- `vad.py` — voice activity detection with end-of-speech frame counting
-- `pipeline.py` — orchestrates everything, owns the state machine
-
-Integration callbacks are registered by the host application:
-- `register_wake_detector(fn)` — synchronous, called per chunk
-- `register_stt(fn)` — async, receives list of AudioChunks
-- `register_intent(fn)` — async, receives transcript text
-- `register_tts(fn)` — async, returns int16 numpy audio
-
-## Design decisions
-
-- No TCP sockets between components. Everything is in-process function calls.
-- Pre-roll buffer lives in CaptureManager, drained on wake word detection.
-- AEC reference signal comes via callback from PlaybackManager, not a loopback device.
-- Playback uses a priority queue (wake beep > TTS > music) with barge-in cancellation.
-- VAD uses WebRTC VAD with fallback to energy-based detection if webrtcvad not installed.
-
-## Build and test
-
-```bash
-pip install -e ".[aec,dev]"
-pytest
-ruff check src/
+```
+Capture (sounddevice) → VAD speech gate → openWakeWord (Wyoming TCP :10400)
+  → Wake sound (15% volume!) → Listen (VAD end-of-speech)
+  → Parallel STT: Speech-to-Phrase (:10302) + ChaosVector STT (:10301)
+  → Intent classifier → Route:
+      simple_local → context engine / local time / humidity
+      device cmd → rewrite dim→brightness → HA WebSocket (fresh per request)
+      general → context-enriched LLM streaming (E4B on iGPU :8080)
+  → TTS: cache check → Kokoro remote (:10210) → Piper local fallback
+  → Playback (sounddevice, 15% wake beep volume)
+  → Follow-up mode (5s listen without re-wake)
 ```
 
-## Known TODOs
+## Key modules
 
-- Software AEC is currently a simple echo gate (mute during tail). Real WebRTC AEC3 integration needs webrtc-audio-processing Python bindings.
-- No tests yet — this is a scaffold.
-- Config file loading (YAML/JSON) not implemented.
-- Metrics/health endpoint for monitoring not implemented.
+| Module | Purpose |
+|--------|---------|
+| `main.py` | Entry point, YAML config loader |
+| `orchestrator.py` | State machine, intent routing, all features |
+| `capture.py` | Thread-safe audio capture (stdlib queue bridge) |
+| `playback.py` | Priority-queued playback with barge-in |
+| `wake.py` | Wyoming TCP wake word client |
+| `stt.py` | ChaosVector STT (Wyoming TCP, per-request) |
+| `stt_fast.py` | Speech-to-Phrase fast path (Wyoming TCP) |
+| `tts.py` | TTS waterfall: remote Kokoro → local Piper |
+| `tts_cache.py` | LRU cache (200 entries) + pre-warm on startup |
+| `llm.py` | OpenAI/Ollama dual-API streaming client |
+| `context.py` | Context engine HTTP client (60s refresh) |
+| `ha.py` | HA WebSocket (fresh connection per intent) |
+| `stt_filters.py` | Name corrections + hallucination filter |
+| `feedback.py` | JSONL interaction logging |
+| `speaker.py` | Speaker verification (Resemblyzer HTTP) |
+| `sounds.py` | Thinking indicator + sound loading |
+| `health.py` | HA sensor (sensor.chaosvector_audio) |
+| `wake_livekit.py` | LiveKit WakeWord Wyoming wrapper (disabled) |
+| `wake_verify.py` | Speaker-specific wake verifier (disabled) |
+
+## Critical lessons (DO NOT repeat)
+
+1. **Wake beep at 15% volume** — full volume garbles STT first word
+2. **Pre-roll = room noise before wake, NOT the wake word itself**
+3. **Synthetic wake training ≠ real-world TV rejection** — always soak test
+4. **VAD speech gate essential** — filters sniffles/clicks before wake detector
+5. **Fresh TCP per request** — eliminates stale connection bugs
+6. **HA doesn't understand "dim"** — rewrite to "set brightness"
+7. **iGPU speed is bandwidth-limited** — smaller model ≠ faster
+
+## Config reference (config.yaml)
+
+Key values that affect behavior:
+- `wake_word.energy_threshold: 320` — reject quiet noise
+- `wake_word.gain: 4.0` — boost audio to wake detector
+- `chime_blanking_ms: 500` — skip audio after wake beep
+- `echo_gate_ms: 300` — suppress wake after playback
+- `vad.silence_frames: 25` — 500ms silence = end of speech
+- `fast_stt.enabled: true` — parallel Speech-to-Phrase
+- `volume_adapt.enabled: true` — scale TTS to match speech RMS
+
+## Rollback to satellite.py
+
+```bash
+systemctl --user stop chaosvector-audio
+systemctl --user enable --now pifi-voice.service
+```
+
+## SSH access
+
+- Pi 5: `ssh chaos@10.1.1.235`
+- microchaos2 (LLM): `ssh root@10.1.1.228`
+- microchaos3 (STT/TTS): `ssh root@10.1.1.240`
+- HA: `http://10.1.1.53:8123`
