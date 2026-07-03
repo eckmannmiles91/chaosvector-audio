@@ -369,6 +369,11 @@ class Orchestrator:
         self._shadow_audio_queue = shadow_queue
         asyncio.create_task(self._shadow_wake.start(shadow_queue))
 
+        # HTTP API for proactive announcements (/speak endpoint)
+        from chaosvector_audio.http_api import HTTPApi, APIConfig
+        self._http_api = HTTPApi(APIConfig(port=8300))
+        await self._http_api.start(speak_fn=self._speak)
+
         self._running = True
         log.info("orchestrator started")
 
@@ -439,6 +444,8 @@ class Orchestrator:
         self._running = False
         # Save TTS cache to disk before shutdown
         self._tts_cache.save_to_disk()
+        if hasattr(self, "_http_api"):
+            await self._http_api.stop()
         await self._health.stop()
         await self._wake.stop()
         await self._playback.stop()
@@ -748,15 +755,33 @@ class Orchestrator:
             fast_task = asyncio.create_task(transcribe_fast(chunks, self._fast_stt_config))
             full_task = asyncio.create_task(transcribe(chunks, self._stt_config))
 
-        # Wait for both to complete (both are fast, <1s typically)
-        fast_result, full_result = await asyncio.gather(fast_task, full_task)
+        # Race: if S2P finishes first with a match, cancel the full STT
+        # to free compute on microchaos3. If S2P returns None, wait for full.
+        fast_result = None
+        full_result = None
+        pending = {fast_task, full_task}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task is fast_task:
+                    fast_result = task.result()
+                    if fast_result and full_task in pending:
+                        # S2P matched — cancel full STT (saves compute)
+                        full_task.cancel()
+                        pending.discard(full_task)
+                        log.info("S2P early match, cancelled full STT")
+                elif task is full_task:
+                    try:
+                        full_result = task.result()
+                    except asyncio.CancelledError:
+                        pass
 
         self._stt_ms = (time.monotonic() - self._stt_start) * 1000
 
         # Prefer S2P if it matched (exact entity names, no garbling)
         if fast_result:
             log.info("STT parallel: S2P matched \"%s\", full got \"%s\" (%.0fms)",
-                     fast_result, full_result or "", self._stt_ms)
+                     fast_result, full_result or "(cancelled)", self._stt_ms)
             speaker_audio = np.concatenate([c.samples for c in chunks[:150]])
             asyncio.create_task(self._identify_speaker(speaker_audio))
             return fast_result
@@ -1129,6 +1154,23 @@ class Orchestrator:
 
                 if self._speaker_name:
                     parts.append(f"[Speaker: {self._speaker_name}]")
+
+                # Last-controlled device for pronoun context
+                if self._last_entities and (time.monotonic() - self._last_entity_ts < 300):
+                    parts.append(f"[Last device: {self._last_entities[0]}]")
+
+                # Time of day category
+                from datetime import datetime as _dt
+                hour = _dt.now().hour
+                if 5 <= hour < 12:
+                    tod = "morning"
+                elif 12 <= hour < 17:
+                    tod = "afternoon"
+                elif 17 <= hour < 21:
+                    tod = "evening"
+                else:
+                    tod = "night"
+                parts.append(f"[Time: {_dt.now().strftime('%I:%M %p %A')}, {tod}]")
 
                 # Recent interactions for conversational context
                 if self._recent_interactions:
