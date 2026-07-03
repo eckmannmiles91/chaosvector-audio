@@ -170,6 +170,7 @@ class PlaybackManager:
         )
         offset = 0
 
+        loop = asyncio.get_running_loop()
         with stream:
             while offset < len(audio) and not self._cancelled.is_set():
                 end = min(offset + block_size, len(audio))
@@ -179,10 +180,10 @@ class PlaybackManager:
                 if self._reference_cb is not None:
                     self._reference_cb(block)
 
-                stream.write(block.reshape(-1, item.channels))
+                # Non-blocking write — prevents event loop starvation
+                shaped = block.reshape(-1, item.channels)
+                await loop.run_in_executor(None, stream.write, shaped)
                 offset = end
-                # Yield control so barge-in can fire
-                await asyncio.sleep(0)
 
         if self._cancelled.is_set():
             log.debug("playback interrupted at %.1f%%", offset / len(audio) * 100)

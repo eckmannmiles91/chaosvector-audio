@@ -2,20 +2,25 @@
 
 Caches synthesis results in memory (LRU) and optionally pre-warms
 with time strings and frequent responses on startup.
+Persists to disk so cache survives daemon restarts.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import pickle
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+_CACHE_FILE = Path("/tmp/chaosvector_tts_cache.pkl")
 
 
 @dataclass
@@ -64,6 +69,33 @@ class TTSCache:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
+    def save_to_disk(self) -> None:
+        """Persist cache to disk for restart survival."""
+        try:
+            _CACHE_FILE.write_bytes(pickle.dumps(dict(self._cache)))
+            log.info("TTS cache saved to disk: %d entries", len(self._cache))
+        except Exception as e:
+            log.debug("TTS cache save failed: %s", e)
+
+    def load_from_disk(self) -> int:
+        """Load cache from disk. Returns number of entries loaded."""
+        try:
+            if not _CACHE_FILE.exists():
+                return 0
+            data = pickle.loads(_CACHE_FILE.read_bytes())
+            loaded = 0
+            for key, entry in data.items():
+                if isinstance(entry, CachedAudio):
+                    self._cache[key] = entry
+                    loaded += 1
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+            log.info("TTS cache loaded from disk: %d entries", loaded)
+            return loaded
+        except Exception as e:
+            log.debug("TTS cache load failed: %s", e)
+            return 0
+
 
 # Common responses that should be pre-cached
 _PRECACHE_PHRASES = [
@@ -81,11 +113,16 @@ _PRECACHE_PHRASES = [
 ]
 
 
-def generate_time_phrases() -> list[str]:
-    """Generate time phrases for the next 10 minutes."""
+def generate_time_phrases(hours_ahead: int = 2) -> list[str]:
+    """Generate time phrases for the next N hours.
+
+    Covers the rolling window so time queries always hit the cache.
+    Called on startup and periodically by the precache loop.
+    Default 2 hours = 120 phrases, fits well within the 200-entry LRU.
+    """
     phrases = []
     now = datetime.now()
-    for delta_min in range(10):
+    for delta_min in range(hours_ahead * 60):
         t = now + timedelta(minutes=delta_min)
         hour = t.hour % 12 or 12
         minute = t.minute
@@ -109,6 +146,10 @@ async def prewarm_cache(cache: TTSCache, synthesize_fn, config) -> int:
 
     Returns number of phrases cached.
     """
+    # Load disk cache first (instant, no TTS calls needed)
+    disk_loaded = cache.load_from_disk()
+
+    # Only synthesize phrases not already in cache (from disk or prior)
     phrases = _PRECACHE_PHRASES + generate_time_phrases()
     cached = 0
 
@@ -124,5 +165,10 @@ async def prewarm_cache(cache: TTSCache, synthesize_fn, config) -> int:
         except Exception as e:
             log.debug("precache failed for '%s': %s", phrase[:30], e)
 
-    log.info("TTS cache prewarmed: %d phrases (total %d)", cached, cache.size)
+    # Save to disk after prewarm so next restart is fast
+    if cached > 0:
+        cache.save_to_disk()
+
+    log.info("TTS cache prewarmed: %d from disk, %d synthesized (total %d)",
+             disk_loaded, cached, cache.size)
     return cached

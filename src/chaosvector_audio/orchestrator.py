@@ -277,7 +277,7 @@ class Orchestrator:
         self._thinking = ThinkingIndicator(self._playback, config.sounds_dir)
 
         # TTS cache
-        self._tts_cache = TTSCache(max_size=200)
+        self._tts_cache = TTSCache(max_size=300)
 
         # Lazy-loaded from pi-fi-software
         self._classifier = None
@@ -429,12 +429,15 @@ class Orchestrator:
                             if synthesized:
                                 log.info("precache: %d new entries synthesized (total %d)",
                                          synthesized, self._tts_cache.size)
+                                self._tts_cache.save_to_disk()
             except Exception as e:
                 log.debug("precache loop error: %s", e)
             await asyncio.sleep(60)  # refresh every 60 seconds
 
     async def stop(self) -> None:
         self._running = False
+        # Save TTS cache to disk before shutdown
+        self._tts_cache.save_to_disk()
         await self._health.stop()
         await self._wake.stop()
         await self._playback.stop()
@@ -675,6 +678,17 @@ class Orchestrator:
             except _q.Empty:
                 break
 
+        # Start streaming STT session for follow-up (same as _listen)
+        self._streaming_stt = StreamingSTTSession(StreamingSTTConfig(
+            host=self._stt_config.host,
+            port=self._stt_config.port,
+            language=self._stt_config.language,
+            timeout=self._stt_config.timeout,
+        ))
+        stt_connected = await self._streaming_stt.start()
+        if not stt_connected:
+            log.warning("Follow-up streaming STT failed, will fall back to buffered")
+
         # Use normal listen with follow-up timeout
         log.info("follow-up: listening for %.0fs...", self.config.follow_up_timeout)
         self._vad.reset()
@@ -691,10 +705,14 @@ class Orchestrator:
                 if self._vad._state.name == "SPEECH":
                     speech_started = True
                     utterance.append(chunk)
+                    if stt_connected:
+                        await self._streaming_stt.send_chunk(chunk)
                 elif elapsed > self.config.follow_up_timeout:
                     return None  # timed out waiting for speech
             else:
                 utterance.append(chunk)
+                if stt_connected:
+                    await self._streaming_stt.send_chunk(chunk)
                 if end_of_speech and elapsed > 1.5:  # min 1.5s after speech starts
                     break
                 if elapsed > self.config.follow_up_timeout + self.config.listen_timeout:
