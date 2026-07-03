@@ -389,7 +389,7 @@ class Orchestrator:
                 try:
                     result = await synthesize(text, self._tts_config)
                     if result and result.audio is not None:
-                        self._tts_cache.put(text, result.audio, result.sample_rate, result.audio_bytes)
+                        self._tts_cache.put(text, result.audio, result.sample_rate, result.channels, result.duration_ms)
                         count += 1
                 except Exception as e:
                     log.debug("static precache failed: %s", e)
@@ -421,7 +421,7 @@ class Orchestrator:
                                         if result and result.audio is not None:
                                             self._tts_cache.put(
                                                 text, result.audio, result.sample_rate,
-                                                result.audio_bytes,
+                                                result.channels, result.duration_ms,
                                             )
                                             synthesized += 1
                                     except Exception as e:
@@ -665,7 +665,7 @@ class Orchestrator:
         # Wait for playback + echo to fully clear
         while self._playback.is_playing:
             await asyncio.sleep(0.05)
-        await asyncio.sleep(1.5)  # let room reverb settle
+        await asyncio.sleep(0.5)  # XVF3800 hardware AEC handles echo, just clear reverb tail
 
         # Drain any stale audio from the capture queue
         while True:
@@ -1281,8 +1281,17 @@ class Orchestrator:
 
     # -- Location resolution -------------------------------------------------
 
+    # Cache geocoding results for 10 minutes (people don't teleport between cities)
+    _geocode_cache: dict[str, tuple[str, float]] = {}
+    _GEOCODE_TTL = 600  # 10 minutes
+
     async def _get_person_city(self, name: str) -> str | None:
         """Get city name for a person who is 'away' via HA GPS + reverse geocoding."""
+        # Check cache first
+        cached = self._geocode_cache.get(name.lower())
+        if cached and (time.monotonic() - cached[1]) < self._GEOCODE_TTL:
+            return cached[0]
+
         try:
             # Look up person entity in HA
             person_id = f"person.{name.lower()}"
@@ -1316,6 +1325,8 @@ class Orchestrator:
 
             address = geo.get("address", {})
             city = address.get("city") or address.get("town") or address.get("suburb") or address.get("village")
+            if city:
+                self._geocode_cache[name.lower()] = (city, time.monotonic())
             return city
 
         except Exception as e:

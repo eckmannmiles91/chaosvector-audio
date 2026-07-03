@@ -255,10 +255,13 @@ class LLMClient:
         if not any_yielded:
             yield _FALLBACK_RESPONSE
 
-        # Update history
+        # Update history — strip context enrichment blocks so follow-up
+        # turns don't see stale weather/calendar data
         complete = "".join(full_response).strip()
         if complete:
-            self._history.append({"role": "user", "content": prompt})
+            import re as _re
+            raw_prompt = _re.sub(r"\[(?:Weather|Calendar|Presence|Forecast|Lights|Thermostat|Plex)\].*?\n", "", prompt).strip()
+            self._history.append({"role": "user", "content": raw_prompt})
             self._history.append({"role": "assistant", "content": complete})
 
 
@@ -267,6 +270,9 @@ def _find_sentence_break(text: str) -> int | None:
     for i, ch in enumerate(text):
         if ch in ".!?" and i + 1 < len(text) and text[i + 1] in " \n":
             if ch == "." and _ABBREVS.search(text[: i + 1]):
+                continue
+            # Don't split on decimal numbers (e.g., "72.5 degrees")
+            if ch == "." and i > 0 and text[i - 1].isdigit():
                 continue
             return i + 2
         if ch == "\n" and i + 1 < len(text) and text[i + 1] == "\n":

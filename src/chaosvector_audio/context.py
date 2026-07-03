@@ -91,6 +91,15 @@ class ContextClient:
                     return data.get("answer")
         except Exception as e:
             log.warning("context engine query failed (%s): %s", query_type, e)
+        # Fall back to disk cache if HTTP failed
+        try:
+            cache_data = json.loads(Path(self.config.cache_path).read_text())
+            answer = cache_data.get(query_type, {}).get("answer")
+            if answer:
+                log.info("context engine: using disk cache for %s", query_type)
+                return answer
+        except Exception:
+            pass
         return None
 
     async def get_relevant_context(self, query: str, speaker: str | None = None) -> dict | None:
