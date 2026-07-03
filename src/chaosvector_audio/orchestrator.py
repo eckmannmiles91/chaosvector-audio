@@ -907,6 +907,13 @@ class Orchestrator:
         if context_query and self._context.is_available:
             answer = await self._context.get_answer(context_query)
             if answer:
+                # Clean up weather text (context engine quirks)
+                if context_query in ("weather", "forecast"):
+                    answer = answer.replace("partlycloudy", "partly cloudy")
+                    answer = answer.replace("mostlycloudy", "mostly cloudy")
+                    answer = answer.replace("mostlysunny", "mostly sunny")
+                    answer = answer.replace("partlysunny", "partly sunny")
+
                 # If user asked about tomorrow, strip the "today" portion
                 if context_query == "forecast" and "tomorrow" in transcript.lower():
                     import re as _re
@@ -919,21 +926,48 @@ class Orchestrator:
                 if context_query == "presence":
                     import re as _re
                     name_match = _re.search(r"where(?:'?s|\s+is)\s+(\w+)", transcript, _re.IGNORECASE)
-                    if name_match:
-                        person = name_match.group(1)
-                        # Find the sentence about this person
+                    person = name_match.group(1) if name_match else None
+                    # Filter out non-name words (the, everyone, everybody, etc.)
+                    non_names = {"the", "everyone", "everybody", "all", "they", "people", "family"}
+                    if person and person.lower() in non_names:
+                        person = None
+
+                    if person:
+                        # Name aliases (STT output → context engine name)
+                        _name_aliases = {
+                            "kinzleigh": "kinz", "kinsley": "kinz", "kenzie": "kinz",
+                        }
+                        search_names = [person.lower()]
+                        alias = _name_aliases.get(person.lower())
+                        if alias:
+                            search_names.append(alias)
+
+                        # Find the sentence about this specific person
                         person_answer = None
                         for sentence in answer.split(". "):
-                            if person.lower() in sentence.lower():
+                            if any(n in sentence.lower() for n in search_names):
                                 person_answer = sentence.strip().rstrip(".") + "."
                                 break
                         if person_answer:
                             answer = person_answer
                         # If "away", try to get city from GPS
                         if "away" in answer.lower():
-                            city = await self._get_person_city(person)
+                            # Use HA entity name (alias if available)
+                            ha_name = alias if alias else person.lower()
+                            city = await self._get_person_city(ha_name)
                             if city:
                                 answer = answer.replace("is away", f"is in {city}").replace("is Away", f"is in {city}")
+                    else:
+                        # General "where is everyone" — resolve ALL away people
+                        if "away" in answer.lower():
+                            for sentence in answer.split(". "):
+                                away_match = _re.search(r"(\w+)\s+is\s+away", sentence, _re.IGNORECASE)
+                                if away_match:
+                                    away_name = away_match.group(1)
+                                    city = await self._get_person_city(away_name)
+                                    if city:
+                                        answer = answer.replace(f"{away_name} is away", f"{away_name} is in {city}")
+                                        answer = answer.replace(f"{away_name} is Away", f"{away_name} is in {city}")
 
                 log.info("Context answer (%s): %s", context_query, answer[:80])
                 await self._speak(answer)
