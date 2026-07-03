@@ -299,6 +299,7 @@ class Orchestrator:
 
         # Conversation tracking
         self._last_interaction_time: float = 0.0
+        self._last_response_text: str = ""  # for adaptive follow-up timeout
         self._recent_interactions: list[tuple[str, str]] = []  # (transcript, response) last 3
         self._last_entities: list[str] = []  # entity names for pronoun resolution
         self._last_entity_ts: float = 0.0
@@ -554,14 +555,15 @@ class Orchestrator:
         self._last_playback_end = time.monotonic()
 
         # Follow-up mode: listen again after conversational responses
-        # Requires AEC mic source (ec_source) to avoid hearing own TTS
+        # Adaptive timeout: short after confirmations, longer after detailed answers
         while wants_followup and self._running:
-            log.info("=== FOLLOW-UP (%.0fs window) ===", self.config.follow_up_timeout)
+            followup_timeout = self._adaptive_followup_timeout()
+            log.info("=== FOLLOW-UP (%.0fs window) ===", followup_timeout)
             # Brief pause for echo gate after TTS
             await asyncio.sleep(0.3)
 
-            # Listen with follow-up timeout (shorter than normal)
-            utterance = await self._listen_followup()
+            # Listen with adaptive follow-up timeout
+            utterance = await self._listen_followup(timeout=followup_timeout)
             if not utterance:
                 log.info("follow-up: no speech, returning to IDLE")
                 break
@@ -657,7 +659,7 @@ class Orchestrator:
             return None
         return utterance
 
-    async def _listen_followup(self) -> list[AudioChunk] | None:
+    async def _listen_followup(self, timeout: float | None = None) -> list[AudioChunk] | None:
         """Listen for follow-up speech without wake word.
 
         Simple approach: wait for playback to end, then use normal VAD
@@ -690,7 +692,8 @@ class Orchestrator:
             log.warning("Follow-up streaming STT failed, will fall back to buffered")
 
         # Use normal listen with follow-up timeout
-        log.info("follow-up: listening for %.0fs...", self.config.follow_up_timeout)
+        fu_timeout = timeout or self.config.follow_up_timeout
+        log.info("follow-up: listening for %.0fs...", fu_timeout)
         self._vad.reset()
         utterance: list[AudioChunk] = []
         listen_start = time.monotonic()
@@ -707,7 +710,7 @@ class Orchestrator:
                     utterance.append(chunk)
                     if stt_connected:
                         await self._streaming_stt.send_chunk(chunk)
-                elif elapsed > self.config.follow_up_timeout:
+                elif elapsed > fu_timeout:
                     return None  # timed out waiting for speech
             else:
                 utterance.append(chunk)
@@ -715,7 +718,7 @@ class Orchestrator:
                     await self._streaming_stt.send_chunk(chunk)
                 if end_of_speech and elapsed > 1.5:  # min 1.5s after speech starts
                     break
-                if elapsed > self.config.follow_up_timeout + self.config.listen_timeout:
+                if elapsed > fu_timeout + self.config.listen_timeout:
                     break
 
         if not utterance:
@@ -838,7 +841,16 @@ class Orchestrator:
                 return False
 
             # Route based on intent type
-            if intent_type == "simple_local":
+            if intent_type == "timer":
+                response_text = await self._handle_timer(intents[0])
+                route = "timer"
+            elif intent_type == "reminder":
+                response_text = await self._handle_reminder(intents[0])
+                route = "reminder"
+            elif intent_type == "alarm":
+                response_text = await self._handle_alarm(intents[0])
+                route = "alarm"
+            elif intent_type == "simple_local":
                 response_text = await self._handle_simple_local(transcript, context_query)
                 route = f"context:{context_query}" if context_query else "local"
             elif intent_type == "general" and _DEVICE_CMD_RE.search(transcript):
@@ -878,6 +890,7 @@ class Orchestrator:
 
             # Track interaction
             self._last_interaction_time = time.monotonic()
+            self._last_response_text = response_text or ""
             if response_text:
                 self._recent_interactions.append((transcript, response_text))
                 if len(self._recent_interactions) > 3:
@@ -1389,8 +1402,15 @@ class Orchestrator:
 
     # -- Pronoun resolution, entity tracking, error sound --------------------
 
+    # Matches pronouns in device commands: "turn it off", "make it brighter", "set it to 50%"
     _PRONOUN_RE = re.compile(
-        r"\b(?:turn|switch|toggle|set)\s+(?:it|that|them|those)\s+(?:on|off|up|down)\b",
+        r"\b(it|that|them|those)\b",
+        re.IGNORECASE,
+    )
+
+    # Relative brightness commands: "make it brighter/dimmer"
+    _RELATIVE_CMD_RE = re.compile(
+        r"(?:make|turn)\s+(?:it|that|them|those)\s+(brighter|dimmer|louder|quieter)",
         re.IGNORECASE,
     )
 
@@ -1402,26 +1422,66 @@ class Orchestrator:
         if time.monotonic() - self._last_entity_ts > 300:
             self._last_entities.clear()
             return text
+
+        entity = self._last_entities[0]
+
+        # Handle relative brightness: "make it brighter" → "set X brightness to Y%"
+        rel_match = self._RELATIVE_CMD_RE.search(text)
+        if rel_match:
+            direction = rel_match.group(1).lower()
+            if direction == "brighter":
+                resolved = f"set {entity} brightness to 100 percent"
+            elif direction == "dimmer":
+                resolved = f"set {entity} brightness to 20 percent"
+            else:
+                resolved = text  # louder/quieter — pass through
+            if resolved != text:
+                log.info("relative command resolved: \"%s\" → \"%s\"", text, resolved)
+                return resolved
+
+        # General pronoun replacement in device commands
         if self._PRONOUN_RE.search(text):
-            entity = self._last_entities[0]
-            resolved = self._PRONOUN_RE.sub(
-                lambda m: m.group().replace("it", entity).replace("that", entity)
-                    .replace("them", entity).replace("those", entity),
-                text,
-            )
-            log.info("pronoun resolved: \"%s\" → \"%s\"", text, resolved)
-            return resolved
+            # Only replace if it looks like a device command
+            if re.search(r"\b(?:turn|switch|toggle|set|dim|make)\b", text, re.I):
+                resolved = self._PRONOUN_RE.sub(entity, text)
+                log.info("pronoun resolved: \"%s\" → \"%s\"", text, resolved)
+                return resolved
         return text
+
+    def _adaptive_followup_timeout(self) -> float:
+        """Adaptive follow-up duration based on response length.
+
+        Short confirmations (Done, Got it) → 3s — user likely done
+        Medium answers (weather, presence) → 5s — normal
+        Long LLM responses → 8s — user needs time to process and ask follow-up
+        """
+        text = self._last_response_text
+        if not text:
+            return self.config.follow_up_timeout
+
+        word_count = len(text.split())
+        if word_count <= 5:
+            return 3.0  # short confirmation
+        elif word_count >= 30:
+            return 8.0  # long detailed answer
+        return self.config.follow_up_timeout  # default (5s)
 
     def _track_entities(self, transcript: str) -> None:
         """Extract entity names from device commands for pronoun resolution."""
-        # Simple extraction: take everything after "turn on/off the"
-        m = re.search(r"(?:turn\s+(?:on|off)|toggle)\s+(?:the\s+)?(.+?)\.?$", transcript, re.I)
-        if m:
-            entity = m.group(1).strip()
-            self._last_entities = [entity]
-            self._last_entity_ts = time.monotonic()
-            log.debug("tracking entity: %s", entity)
+        patterns = [
+            r"(?:turn\s+(?:on|off)|toggle)\s+(?:the\s+)?(.+?)\.?$",
+            r"(?:dim|set)\s+(?:the\s+)?(.+?)\s+(?:brightness|to)\s",
+            r"(?:turn|switch)\s+(?:the\s+)?(.+?)\s+(?:on|off)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, transcript, re.I)
+            if m:
+                entity = m.group(1).strip()
+                if entity.lower() not in ("it", "that", "them", "those"):
+                    self._last_entities = [entity]
+                    self._last_entity_ts = time.monotonic()
+                    log.info("tracking entity: %s", entity)
+                    return
 
     async def _play_error_sound(self) -> None:
         """Play error sound on failures."""
@@ -1545,6 +1605,100 @@ class Orchestrator:
                     log.info("restored %d alarm(s)", count)
             except Exception as e:
                 log.debug("alarm restore failed: %s", e)
+
+    async def _handle_timer(self, intent) -> str:
+        """Handle timer intents: set, check, cancel."""
+        if self._timer_mgr is None:
+            response = "Timers aren't available right now."
+            await self._speak(response)
+            return response
+
+        action = intent.timer_action
+        if action is None:
+            response = "I didn't understand that timer command."
+            await self._speak(response)
+            return response
+
+        action_val = action.value
+        if action_val == "set":
+            duration = intent.timer_duration_seconds or 60
+            label = intent.timer_label
+            response = await self._timer_mgr.set_timer(duration, label, self._on_timer_fire)
+        elif action_val == "cancel":
+            response = await self._timer_mgr.cancel_timer(intent.timer_label)
+        elif action_val == "check":
+            response = self._timer_mgr.check_timer(intent.timer_label) if hasattr(self._timer_mgr, "check_timer") else "No active timers."
+        else:
+            response = "I didn't understand that timer command."
+
+        log.info("Timer: %s → %s", action_val, response)
+        await self._speak(response)
+        return response
+
+    async def _handle_reminder(self, intent) -> str:
+        """Handle reminder intents: set, check, cancel."""
+        if self._reminder_mgr is None:
+            response = "Reminders aren't available right now."
+            await self._speak(response)
+            return response
+
+        action = intent.reminder_action
+        if action is None:
+            response = "I didn't understand that reminder command."
+            await self._speak(response)
+            return response
+
+        action_val = action.value
+        if action_val == "set":
+            time_str = intent.reminder_time_str or "in 1 hour"
+            label = intent.reminder_label or "reminder"
+            response = await self._reminder_mgr.set_reminder(
+                time_str, label, self._on_reminder_fire,
+                recurring=getattr(intent, "reminder_recurring", False),
+                recurring_days=getattr(intent, "reminder_recurring_days", None),
+            )
+        elif action_val == "cancel":
+            response = await self._reminder_mgr.cancel_reminder(intent.reminder_label)
+        elif action_val == "check":
+            response = self._reminder_mgr.check_reminders() if hasattr(self._reminder_mgr, "check_reminders") else "No active reminders."
+        else:
+            response = "I didn't understand that reminder command."
+
+        log.info("Reminder: %s → %s", action_val, response)
+        await self._speak(response)
+        return response
+
+    async def _handle_alarm(self, intent) -> str:
+        """Handle alarm intents: set, check, cancel, snooze."""
+        if self._alarm_mgr is None:
+            response = "Alarms aren't available right now."
+            await self._speak(response)
+            return response
+
+        action = intent.alarm_action
+        if action is None:
+            response = "I didn't understand that alarm command."
+            await self._speak(response)
+            return response
+
+        action_val = action.value
+        if action_val == "set":
+            time_str = intent.alarm_time_str or "in 1 hour"
+            label = getattr(intent, "alarm_label", None)
+            response = await self._alarm_mgr.set_alarm(time_str, label, self._on_alarm_fire)
+        elif action_val == "cancel":
+            label = getattr(intent, "alarm_label", None)
+            response = await self._alarm_mgr.cancel_alarm(label)
+        elif action_val == "snooze":
+            response = await self._alarm_mgr.snooze() if hasattr(self._alarm_mgr, "snooze") else "No alarm to snooze."
+        elif action_val == "check":
+            response = self._alarm_mgr.check_alarms() if hasattr(self._alarm_mgr, "check_alarms") else "No active alarms."
+        else:
+            response = "I didn't understand that alarm command."
+
+        log.info("Alarm: %s → %s", action_val, response)
+        await self._speak(response)
+        return response
 
     async def _on_timer_fire(self, label: str, duration: int) -> None:
         """Callback when a timer expires."""
