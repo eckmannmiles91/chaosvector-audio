@@ -599,12 +599,28 @@ class Orchestrator:
             await asyncio.sleep(0.3)
             return
 
+        # Speaker verification in parallel with STT (zero added latency)
+        verify_task = None
+        if self._speaker_config.enabled:
+            speaker_audio = np.concatenate([c.samples for c in utterance[:150]])
+            verify_task = asyncio.create_task(self._identify_speaker(speaker_audio))
+
         # STT
         transcript = await self._process_stt(utterance)
         if not transcript:
+            if verify_task:
+                verify_task.cancel()
             self._wake.force_reconnect()
             await asyncio.sleep(0.3)
             return
+
+        # Wait for speaker verification (should be done by now — ran during STT)
+        if verify_task:
+            await verify_task
+            if self._speaker_name is None:
+                log.info("Wake rejected: unknown speaker")
+                self._wake.force_reconnect()
+                return
 
         # RESPOND
         wants_followup = await self._respond(transcript)
@@ -837,8 +853,6 @@ class Orchestrator:
         if fast_result:
             log.info("STT parallel: S2P matched \"%s\", full got \"%s\" (%.0fms)",
                      fast_result, full_result or "(cancelled)", self._stt_ms)
-            speaker_audio = np.concatenate([c.samples for c in chunks[:150]])
-            asyncio.create_task(self._identify_speaker(speaker_audio))
             return fast_result
 
         # S2P didn't match — use full STT result
@@ -857,10 +871,6 @@ class Orchestrator:
             return None
 
         log.info("Transcript: \"%s\"", transcript)
-
-        # Start speaker verification in background (uses first 3s of audio)
-        speaker_audio = np.concatenate([c.samples for c in chunks[:150]])  # ~3s
-        asyncio.create_task(self._identify_speaker(speaker_audio))
 
         return transcript
 
