@@ -405,8 +405,10 @@ class Orchestrator:
     async def _precache_loop(self) -> None:
         """Periodically fetch predicted answers from context engine and pre-synthesize TTS."""
         import aiohttp
+        from chaosvector_audio.tts import synthesize
         await asyncio.sleep(10)  # initial delay — let services settle
         while self._running:
+            synthesized = 0
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -415,14 +417,12 @@ class Orchestrator:
                     ) as resp:
                         if resp.status == 200:
                             entries = await resp.json()
-                            synthesized = 0
                             for entry in entries:
                                 text = entry.get("answer", "")
                                 if not text:
                                     continue
                                 if not self._tts_cache.get(text):
                                     try:
-                                        from chaosvector_audio.tts import synthesize
                                         result = await synthesize(text, self._tts_config)
                                         if result and result.audio is not None:
                                             self._tts_cache.put(
@@ -432,12 +432,42 @@ class Orchestrator:
                                             synthesized += 1
                                     except Exception as e:
                                         log.debug("precache synth failed: %s", e)
-                            if synthesized:
-                                log.info("precache: %d new entries synthesized (total %d)",
-                                         synthesized, self._tts_cache.size)
-                                self._tts_cache.save_to_disk()
             except Exception as e:
                 log.debug("precache loop error: %s", e)
+
+            # Keep time phrases warm in get_local_time() format (next 5 minutes)
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                for delta in range(5):
+                    t = now + timedelta(minutes=delta)
+                    hour = t.hour % 12 or 12
+                    minute = t.minute
+                    ampm = "AM" if t.hour < 12 else "PM"
+                    if minute == 0:
+                        phrase = f"It's {hour} {ampm}."
+                    elif minute < 10:
+                        phrase = f"It's {hour} oh {minute} {ampm}."
+                    else:
+                        phrase = f"It's {hour} {minute} {ampm}."
+                    if not self._tts_cache.get(phrase):
+                        try:
+                            result = await synthesize(phrase, self._tts_config)
+                            if result and result.audio is not None:
+                                self._tts_cache.put(
+                                    phrase, result.audio, result.sample_rate,
+                                    result.channels, result.duration_ms,
+                                )
+                                synthesized += 1
+                        except Exception as e:
+                            log.debug("precache time synth failed: %s", e)
+            except Exception as e:
+                log.debug("precache time error: %s", e)
+
+            if synthesized:
+                log.info("precache: %d new entries synthesized (total %d)",
+                         synthesized, self._tts_cache.size)
+                self._tts_cache.save_to_disk()
             await asyncio.sleep(60)  # refresh every 60 seconds
 
     async def stop(self) -> None:
@@ -454,6 +484,12 @@ class Orchestrator:
         await self._context.disconnect()
         await self._ha.disconnect()
         log.info("orchestrator stopped")
+
+    def _has_pending_wake(self) -> bool:
+        """Check both wake detectors for pending events (also clears them)."""
+        oww = self._wake.has_pending_wake()
+        shadow = self._shadow_wake.has_pending_wake() if hasattr(self, '_shadow_wake') else False
+        return oww or shadow
 
     async def run(self) -> None:
         """Main loop — runs until cancelled."""
@@ -481,7 +517,22 @@ class Orchestrator:
         # Feed audio to wake word detector (with echo gate)
         feed_task = asyncio.create_task(self._feed_wake_audio())
         try:
-            name, rms = await self._wake.wait_for_wake()
+            # Race both detectors — first to fire wins
+            oww_task = asyncio.create_task(self._wake.wait_for_wake())
+            shadow_task = asyncio.create_task(self._shadow_wake.wait_for_wake())
+            done, pending = await asyncio.wait(
+                {oww_task, shadow_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+                try:
+                    await p
+                except asyncio.CancelledError:
+                    pass
+            winner = done.pop()
+            name, rms = winner.result()
+            source = "shadow" if winner is shadow_task else "oww"
+            log.info("Wake source: %s", source)
         finally:
             feed_task.cancel()
             try:
@@ -775,6 +826,10 @@ class Orchestrator:
                         full_result = task.result()
                     except asyncio.CancelledError:
                         pass
+                    if full_result and fast_task in pending:
+                        fast_task.cancel()
+                        pending.discard(fast_task)
+                        log.info("Full STT ready, cancelled pending S2P")
 
         self._stt_ms = (time.monotonic() - self._stt_start) * 1000
 
@@ -1206,7 +1261,7 @@ class Orchestrator:
         try:
             async for sentence in self._llm.generate_stream(transcript):
                 # Check for barge-in after first sentence is playing
-                if barge_feed is not None and self._wake.has_pending_wake():
+                if barge_feed is not None and self._has_pending_wake():
                     log.info("barge-in detected during LLM stream")
                     self._playback.barge_in()
                     barged = True
@@ -1247,7 +1302,7 @@ class Orchestrator:
                         await self._thinking.stop()
                     # Start barge-in listener AFTER first sentence is queued
                     if barge_feed is None:
-                        self._wake.has_pending_wake()  # clear stale
+                        self._has_pending_wake()  # clear stale
                         barge_feed = asyncio.create_task(self._feed_wake_audio())
                 else:
                     log.warning("TTS failed for sentence %d", sentence_count)
@@ -1257,7 +1312,7 @@ class Orchestrator:
         if not barged:
             # Keep barge-in feed running during playback wait
             if barge_feed is None:
-                self._wake.has_pending_wake()  # clear stale
+                self._has_pending_wake()  # clear stale
                 barge_feed = asyncio.create_task(self._feed_wake_audio())
             barged = await self._wait_playback_with_bargein(timeout=30.0)
 
@@ -1296,7 +1351,7 @@ class Orchestrator:
                 duration = (result.duration_ms / 1000.0) + 2.0
                 self._shadow_wake.mute(duration)
             # Start barge-in listener during playback
-            self._wake.has_pending_wake()  # clear stale
+            self._has_pending_wake()  # clear stale
             barge_feed = asyncio.create_task(self._feed_wake_audio())
             await self._playback.enqueue(
                 result.audio,
@@ -1326,7 +1381,7 @@ class Orchestrator:
         Returns True if barge-in occurred."""
         waited = 0.0
         while self._playback.is_playing and waited < timeout:
-            if self._wake.has_pending_wake():
+            if self._has_pending_wake():
                 log.info("barge-in: stopping playback")
                 self._playback.barge_in()
                 return True

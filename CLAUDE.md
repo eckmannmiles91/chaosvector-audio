@@ -18,7 +18,8 @@ Production voice pipeline daemon for the Pi-Fi smart speaker. Replaces satellite
 ## Architecture
 
 ```
-Capture (sounddevice) → VAD speech gate → openWakeWord (Wyoming TCP :10400)
+Capture (sounddevice) → VAD speech gate → Dual wake: ChaosVector ONNX (shadow, primary)
+                                           + openWakeWord (Wyoming TCP :10400, fallback)
   → Wake sound (15% volume!) → Listen (streaming STT + VAD end-of-speech)
   → Parallel STT: Speech-to-Phrase (:10302) + ChaosVector STT (:10301)
     → S2P early-cancel: if S2P matches, cancel Whisper to free compute
@@ -62,12 +63,14 @@ Capture (sounddevice) → VAD speech gate → openWakeWord (Wyoming TCP :10400)
 - **Pronoun resolution** — "turn on the office light" then "make it dimmer" resolves "it" to office light
 - **Adaptive follow-up** — 3s after confirmations, 5s default, 8s after long answers
 - **TTS disk cache** — 300-entry LRU persists across restarts, 2h rolling time phrase coverage
-- **S2P early-cancel** — cancels Whisper when Speech-to-Phrase matches fast
+- **S2P early-cancel (bidirectional)** — cancels whichever STT path finishes second
 - **HTTP /speak** — HA automations push announcements: `POST :8300/speak {"message": "..."}`
 - **Geocoding cache** — 10min TTL for person location lookups
 - **Weather cleanup** — "partlycloudy" → "partly cloudy"
 - **Context enrichment** — last device, time of day, recent interactions, speaker ID in LLM prompt
 - **Streaming follow-up STT** — audio streamed in real-time during follow-up listening
+- **Dual wake word (shadow primary)** — ChaosVector ONNX model races openWakeWord; first to detect wins. Shadow catches quiet speech openWakeWord misses.
+- **TTS time phrase rolling cache** — precache loop keeps next 5 minutes in get_local_time() format warm
 
 ## Critical lessons (DO NOT repeat)
 
@@ -81,6 +84,8 @@ Capture (sounddevice) → VAD speech gate → openWakeWord (Wyoming TCP :10400)
 8. **Moonshine tiny drops short names** — "Eli" → "the", keep Whisper as primary
 9. **Qwen 3 4B garbage via llama-server** — use Ollama if retrying
 10. **TTS cache put() args must match TTSResult** — audio_bytes doesn't exist
+11. **Shadow wake model >> openWakeWord** — catches quiet speech (rms=341) that OWW misses; promote to primary, keep OWW as fallback
+12. **TTS precache format must match response format** — context engine returns "It's 9:58 AM on Friday, July 3." but get_local_time() returns "It's 9 58 AM." — cache miss every time
 
 ## Config reference (config.yaml)
 

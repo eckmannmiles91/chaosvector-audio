@@ -46,6 +46,8 @@ class ShadowWakeDetector:
         self._mute_until: float = 0.0  # monotonic timestamp — muted until this time
         # Rolling audio buffer — last 2 seconds of audio
         self._audio_buf = collections.deque(maxlen=int(SAMPLE_RATE * CLIP_DURATION))
+        self._wake_event = asyncio.Event()
+        self._wake_rms: float = 0.0
 
     def mute(self, duration: float = 2.0) -> None:
         """Mute detection for duration seconds (call before TTS playback)."""
@@ -130,11 +132,26 @@ class ShadowWakeDetector:
                 if self._consecutive >= self.config.trigger_level:
                     log.info("SHADOW WAKE: detected (prob=%.3f, rms=%.0f, infer=%.1fms)",
                              prob, rms, infer_ms)
+                    self._wake_rms = rms
+                    self._wake_event.set()
                     self._consecutive = 0
             else:
                 if self._consecutive > 0:
                     log.debug("shadow wake: reset (prob=%.3f < %.2f)", prob, self.config.threshold)
                 self._consecutive = 0
+
+    async def wait_for_wake(self) -> tuple[str, float]:
+        """Block until wake word is detected. Returns (name, rms)."""
+        self._wake_event.clear()
+        await self._wake_event.wait()
+        return "hey_jarvis", self._wake_rms
+
+    def has_pending_wake(self) -> bool:
+        """Non-blocking check if a wake event fired (for barge-in detection)."""
+        if self._wake_event.is_set():
+            self._wake_event.clear()
+            return True
+        return False
 
     def stop(self):
         self._running = False
