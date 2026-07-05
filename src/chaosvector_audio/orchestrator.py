@@ -1024,6 +1024,24 @@ class Orchestrator:
                 await self._speak(response)
                 return response
 
+        # Weather/forecast → answer with the LLM using a full forecast digest,
+        # so it addresses the actual question ("is it going to rain / when / how
+        # much", "do I need an umbrella", "warmer tomorrow?") instead of reciting
+        # a fixed template. Falls through to the canned answer if unavailable.
+        if context_query in ("weather", "forecast") and self._context.is_available and self._llm.is_available:
+            digest = await self._context.get_answer("weather_detail")
+            if digest:
+                prompt = (
+                    f"[Weather] {digest} "
+                    f"(Use only this data to answer the question in one or two short "
+                    f"spoken sentences. For rain, say whether it will rain, roughly "
+                    f"when, and how much.)\n"
+                    f"{transcript}"
+                )
+                log.info("Weather -> LLM (digest: %s)", digest[:90])
+                await self._respond_llm(prompt)
+                return ""
+
         # Everything else: ask context engine
         if context_query and self._context.is_available:
             answer = await self._context.get_answer(context_query)
