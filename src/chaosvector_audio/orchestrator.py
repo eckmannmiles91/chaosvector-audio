@@ -1318,6 +1318,12 @@ class Orchestrator:
                         self._tts_cache.put(sentence, result.audio, result.sample_rate,
                                             result.channels, result.duration_ms)
                 if result is not None:
+                    # Mute the shadow wake detector for this sentence's playback +
+                    # 2s echo tail so our own TTS echoing into the mic doesn't
+                    # self-trigger barge-in. openWakeWord still catches a real
+                    # "Hey Jarvis" barge-in (same protection as _speak()).
+                    if hasattr(self, '_shadow_wake'):
+                        self._shadow_wake.mute((result.duration_ms / 1000.0) + 2.0)
                     await self._playback.enqueue(
                         result.audio,
                         sample_rate=result.sample_rate,
