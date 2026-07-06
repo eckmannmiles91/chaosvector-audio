@@ -81,6 +81,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         min_speech_frames=vad.get("min_speech_frames", 3),
         listen_timeout=vad.get("listen_timeout", 10.0),
 
+        wake_beep=raw.get("wake_beep", False),
         chime_blanking_ms=raw.get("chime_blanking_ms", 500),
         echo_gate_ms=raw.get("echo_gate_ms", 300),
 

@@ -137,6 +137,11 @@ class PipelineConfig:
     # Follow-up
     follow_up_timeout: float = 5.0
 
+    # Wake beep — audible chime when the wake word fires. Disabled by default:
+    # modern smart speakers dropped it, and without it TV false-wakes are silent
+    # (speaker verification still blocks any response).
+    wake_beep: bool = False
+
     # Chime blanking
     chime_blanking_ms: int = 100
 
@@ -583,14 +588,15 @@ class Orchestrator:
 
         # Play wake sound at low volume (15%, matches satellite.py)
         # Don't wait — play in background while listening starts
-        quiet_beep = (self._beep.astype(np.float64) * 0.15).astype(np.int16)
-        # Mute shadow during beep + room reverb
-        if hasattr(self, '_shadow_wake'):
-            self._shadow_wake.mute(1.5)
-        await self._playback.enqueue(
-            quiet_beep, sample_rate=self._beep_rate,
-            priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
-        )
+        if self.config.wake_beep:
+            quiet_beep = (self._beep.astype(np.float64) * 0.15).astype(np.int16)
+            # Mute shadow during beep + room reverb
+            if hasattr(self, '_shadow_wake'):
+                self._shadow_wake.mute(1.5)
+            await self._playback.enqueue(
+                quiet_beep, sample_rate=self._beep_rate,
+                priority=PlaybackPriority.WAKE_BEEP, label="wake-beep",
+            )
 
         # LISTENING
         utterance = await self._listen()

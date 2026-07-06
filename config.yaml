@@ -23,7 +23,8 @@ vad:
   min_speech_frames: 3
   listen_timeout: 10.0
 
-chime_blanking_ms: 500      # skip audio after wake beep (room reverb)
+wake_beep: false            # no audible chime on wake (TV false-wakes stay silent; verification still gates responses)
+chime_blanking_ms: 150      # skip wake-word tail only (beep disabled, so no reverb to blank)
 echo_gate_ms: 300           # suppress wake detection after playback
 
 stt:
