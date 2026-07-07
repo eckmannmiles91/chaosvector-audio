@@ -46,7 +46,7 @@ tts:
   piper_enabled: true
 
 llm:
-  url: "http://10.1.1.228:8080"  # Gemma 4 E4B on microchaos2 iGPU (llama-server)
+  url: "http://10.1.1.240:8081"  # Gemma 4 E4B on OpenVINO iGPU (microchaos3, primary, reliable). 10.1.1.228:8080 is the old SYCL rollback — do NOT point here.
   model: ""                       # llama-server serves single model
   system_prompt_file: "/home/chaos/pi-fi-software/voice/system_prompt_phase1b.txt"
   timeout: 15.0
