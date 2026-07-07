@@ -84,6 +84,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         wake_beep=raw.get("wake_beep", False),
         chime_blanking_ms=raw.get("chime_blanking_ms", 500),
         echo_gate_ms=raw.get("echo_gate_ms", 300),
+        backend_error_cooldown_s=raw.get("backend_error_cooldown_s", 90.0),
 
         stt_host=stt.get("host", "10.1.1.240"),
         stt_port=stt.get("port", 10301),
@@ -98,7 +99,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         tts_voice=tts.get("voice", "af_heart"),
         tts_timeout=tts.get("timeout", 10.0),
 
-        ollama_url=llm.get("url", "http://10.1.1.228:8080"),
+        ollama_url=llm.get("url", "http://10.1.1.240:8081"),
         ollama_model=llm.get("model", ""),
         ollama_system_prompt_file=llm.get("system_prompt_file", ""),
         ollama_timeout=llm.get("timeout", 15.0),

@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class LLMConfig:
-    url: str = "http://10.1.1.104:11434"
+    url: str = "http://10.1.1.240:8081"  # OpenVINO primary (was stale Ollama default)
     model: str = "gemma4-12b-jarvis"
     timeout: float = 15.0
     max_tokens: int = 120

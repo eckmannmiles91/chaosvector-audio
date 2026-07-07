@@ -26,6 +26,7 @@ vad:
 wake_beep: false            # no audible chime on wake (TV false-wakes stay silent; verification still gates responses)
 chime_blanking_ms: 150      # skip wake-word tail only (beep disabled, so no reverb to blank)
 echo_gate_ms: 300           # suppress wake detection after playback
+backend_error_cooldown_s: 90  # rate-limit "can't reach the LLM" spoken errors to 1 per 90s (silent otherwise)
 
 stt:
   host: "10.1.1.240"

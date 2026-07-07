@@ -118,7 +118,7 @@ class PipelineConfig:
     tts_timeout: float = 10.0
 
     # LLM
-    ollama_url: str = "http://10.1.1.104:11434"
+    ollama_url: str = "http://10.1.1.240:8081"  # OpenVINO primary; never default to the dead SYCL host
     ollama_model: str = "gemma4-12b-jarvis"
     ollama_system_prompt_file: str = ""
     ollama_timeout: float = 15.0
@@ -147,6 +147,11 @@ class PipelineConfig:
 
     # Echo gate: suppress wake detection for this many ms after playback ends
     echo_gate_ms: int = 300
+
+    # Backend-outage announcements ("can't reach the LLM") are rate-limited to at
+    # most one per this window and silent otherwise, so a TV false-wake storm
+    # during an outage can't spam spoken errors all night.
+    backend_error_cooldown_s: float = 90.0
 
     # Speaker verification
     speaker_url: str = "http://10.1.1.228:8500"
@@ -330,6 +335,7 @@ class Orchestrator:
         self._beep = _load_wake_sound(config.pifi_path)
         self._beep_rate = 44100  # wake.wav is 44100Hz
         self._responding = False  # True while TTS is playing (echo gate)
+        self._last_backend_error_time: float = 0.0  # rate-limit backend-outage announcements
         self._last_playback_end: float = 0.0  # for echo gate tail
 
     # -- lifecycle -----------------------------------------------------------
@@ -1279,9 +1285,15 @@ class Orchestrator:
         """Stream response from LLM with sentence-level TTS.
         Supports barge-in: wake word during playback stops response."""
         if not self._llm.is_available:
-            log.warning("LLM not available")
-            await self._speak("I heard you, but I can't reach the language model right now.")
-            return
+            # Self-heal a transient outage: connect() is otherwise only called once at
+            # startup, so a network blip would leave the client dead until a restart.
+            log.info("LLM marked unavailable — attempting reconnect")
+            if not await self._llm.connect():
+                log.warning("LLM not available")
+                await self._announce_backend_unavailable(
+                    "I heard you, but I can't reach the language model right now."
+                )
+                return
 
         log.info("Streaming from LLM...")
 
@@ -1366,7 +1378,7 @@ class Orchestrator:
 
         if sentence_count == 0 and not barged:
             log.warning("LLM produced no response")
-            await self._speak("Sorry, I didn't get a response.")
+            await self._announce_backend_unavailable("Sorry, I didn't get a response.")
 
     async def _speak(self, text: str) -> None:
         """Synthesize and play a single text response.
@@ -1406,6 +1418,21 @@ class Orchestrator:
                 await barge_feed
             except asyncio.CancelledError:
                 pass
+
+    async def _announce_backend_unavailable(self, message: str) -> None:
+        """Speak a backend-outage message at most once per cooldown window.
+
+        Prevents the "kept saying it can't reach the LLM" storm: a TV/noise
+        false-wake that passes speaker verification during an outage produces at
+        most one utterance per backend_error_cooldown_s and is otherwise fully
+        silent (treated like a rejected wake)."""
+        now = time.monotonic()
+        if now - self._last_backend_error_time < self.config.backend_error_cooldown_s:
+            log.info("backend-error announcement suppressed (within %.0fs cooldown)",
+                     self.config.backend_error_cooldown_s)
+            return
+        self._last_backend_error_time = now
+        await self._speak(message)
 
     async def _wait_playback(self, timeout: float = 15.0) -> None:
         """Wait for playback to finish with a timeout to prevent hangs."""
