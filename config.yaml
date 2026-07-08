@@ -64,7 +64,7 @@ context_engine:
   url: "http://10.1.1.176:8400"
 
 speaker_verify:
-  url: "http://10.1.1.228:8500"
+  url: "http://10.1.1.228:8501"  # v2: ERes2Net + VAD (TV<=0.20 vs Miles>=0.34 on eval). v1 Resemblyzer stays on :8500 for rollback.
   enabled: true
 
 follow_up:
