@@ -303,6 +303,7 @@ class Orchestrator:
         self._wake_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self._speaker_name: str | None = None
         self._last_wake_rms: float = 0.0
+        self._last_wake_audio: np.ndarray | None = None  # wake-word audio, for speaker verify (matches enrollment)
         self._speech_rms: float = 0.0
         self._stt_ms: float = 0.0
         self._stt_start: float = 0.0
@@ -584,8 +585,10 @@ class Orchestrator:
         self._interaction_count += 1
         log.info("WAKE #%d: '%s' (rms=%.1f)", self._interaction_count, name, rms)
 
-        # Save wake audio for future verifier training
-        self._save_wake_audio()
+        # Save wake audio for verifier training AND capture it for verification —
+        # enrollment is built from these wake-word clips, so verification must use
+        # the same audio, not the (often short/silent) command utterance.
+        self._last_wake_audio = self._save_wake_audio()
 
         # Barge-in: stop any current playback
         if self._playback.is_playing:
@@ -611,10 +614,16 @@ class Orchestrator:
             await asyncio.sleep(0.3)
             return
 
-        # Speaker verification in parallel with STT (zero added latency)
+        # Speaker verification in parallel with STT (zero added latency).
+        # Verify on wake-word audio (matches enrollment) + command audio for extra
+        # voice. Command-only was scoring near-zero on short/silent utterances.
         verify_task = None
         if self._speaker_config.enabled:
-            speaker_audio = np.concatenate([c.samples for c in utterance[:150]])
+            parts = []
+            if self._last_wake_audio is not None and len(self._last_wake_audio):
+                parts.append(self._last_wake_audio)
+            parts.append(np.concatenate([c.samples for c in utterance[:150]]))
+            speaker_audio = np.concatenate(parts)
             verify_task = asyncio.create_task(self._identify_speaker(speaker_audio))
 
         # STT
@@ -1530,39 +1539,38 @@ class Orchestrator:
 
     # -- Wake audio collection -----------------------------------------------
 
-    def _save_wake_audio(self) -> None:
-        """Save pre-roll + 1s of post-wake audio for verifier training.
-        Captures through the live pipeline path so embeddings match."""
+    def _save_wake_audio(self) -> np.ndarray | None:
+        """Drain the wake-word pre-roll: save it for training AND return it (raw,
+        unpadded) for speaker verification. Enrollment is built from these clips,
+        so verification must use the same audio for matched embeddings."""
         import wave as _wave
         from datetime import datetime
+
+        # Use pre-roll audio (contains the wake word)
+        pre_roll = self._capture.drain_pre_roll()
+        if not pre_roll:
+            return None
+
+        audio = np.concatenate([c.samples for c in pre_roll])
 
         try:
             save_dir = Path("/home/chaos/wake-training/live")
             save_dir.mkdir(parents=True, exist_ok=True)
-
-            # Use pre-roll audio (contains the wake word)
-            pre_roll = self._capture.drain_pre_roll()
-            if not pre_roll:
-                return
-
-            audio = np.concatenate([c.samples for c in pre_roll])
-
-            # Pad to at least 2.5s
+            # Pad to at least 2.5s for the on-disk training clip
             target = int(self.config.sample_rate * 2.5)
-            if len(audio) < target:
-                audio = np.pad(audio, (0, target - len(audio)))
-
+            padded = np.pad(audio, (0, target - len(audio))) if len(audio) < target else audio
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = save_dir / f"wake_{ts}_{self._interaction_count:04d}.wav"
             with _wave.open(str(path), "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(self.config.sample_rate)
-                wf.writeframes(audio[:target].tobytes())
-
+                wf.writeframes(padded[:target].tobytes())
             log.debug("saved wake audio: %s", path.name)
         except Exception as e:
             log.debug("wake audio save failed: %s", e)
+
+        return audio
 
     # -- Pronoun resolution, entity tracking, error sound --------------------
 
