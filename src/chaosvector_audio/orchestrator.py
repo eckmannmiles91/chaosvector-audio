@@ -1454,9 +1454,17 @@ class Orchestrator:
 
     async def _wait_playback_with_bargein(self, timeout: float = 30.0) -> bool:
         """Wait for playback, checking for barge-in every 100ms.
-        Returns True if barge-in occurred."""
+        Returns True if barge-in occurred.
+
+        Keeps the (TV-prone) shadow detector muted for the WHOLE playback so loud
+        TV/noise can't self-trigger a false barge-in that cuts off the response.
+        The per-sentence mute in _respond_llm expires mid-answer because sentences
+        queue up and play longer than they take to synthesize; refreshing it here
+        covers the full playback. openWakeWord still catches a real "Hey Jarvis"."""
         waited = 0.0
         while self._playback.is_playing and waited < timeout:
+            if hasattr(self, '_shadow_wake'):
+                self._shadow_wake.mute(0.3)  # refreshed every 100ms → muted while playing
             if self._has_pending_wake():
                 log.info("barge-in: stopping playback")
                 self._playback.barge_in()
