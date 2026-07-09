@@ -14,7 +14,7 @@ wake_word:
   host: "127.0.0.1"
   port: 10400               # openWakeWord (LiveKit too many false wakes on TV)
   names: ["hey_jarvis"]
-  energy_threshold: 320
+  energy_threshold: 200     # gate for BOTH oww+shadow (raw RMS). Lowered 320->200 to catch quiet/far "Hey Jarvis"; v2 speaker verify (:8501) rejects any TV that slips through
   gain: 4.0
 
 vad:
